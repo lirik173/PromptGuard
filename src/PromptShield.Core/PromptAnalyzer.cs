@@ -1,0 +1,263 @@
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using PromptShield.Abstractions.Analyzers;
+using PromptShield.Abstractions.Analysis;
+using PromptShield.Abstractions.Configuration;
+using PromptShield.Abstractions.Events;
+using PromptShield.Abstractions.Exceptions;
+using PromptShield.Core.Pipeline;
+using PromptShield.Core.Validation;
+
+namespace PromptShield.Core;
+
+/// <summary>
+/// Main implementation of IPromptAnalyzer that orchestrates prompt injection detection.
+/// </summary>
+public sealed class PromptAnalyzer : IPromptAnalyzer
+{
+    private readonly PipelineOrchestrator _pipeline;
+    private readonly AnalysisRequestValidator _validator;
+    private readonly IEnumerable<IPromptShieldEventHandler> _eventHandlers;
+    private readonly PromptShieldOptions _options;
+    private readonly ILogger<PromptAnalyzer> _logger;
+
+    public PromptAnalyzer(
+        PipelineOrchestrator pipeline,
+        AnalysisRequestValidator validator,
+        PromptShieldOptions options,
+        IEnumerable<IPromptShieldEventHandler> eventHandlers,
+        ILogger<PromptAnalyzer>? logger = null)
+    {
+        _pipeline = pipeline ?? throw new ArgumentNullException(nameof(pipeline));
+        _validator = validator ?? throw new ArgumentNullException(nameof(validator));
+        _options = options ?? throw new ArgumentNullException(nameof(options));
+        _eventHandlers = eventHandlers ?? Enumerable.Empty<IPromptShieldEventHandler>();
+        _logger = logger ?? NullLogger<PromptAnalyzer>.Instance;
+    }
+
+    public async Task<AnalysisResult> AnalyzeAsync(
+        string prompt,
+        CancellationToken cancellationToken = default)
+    {
+        var request = new AnalysisRequest
+        {
+            Prompt = prompt
+        };
+
+        return await AnalyzeAsync(request, cancellationToken);
+    }
+
+    public async Task<AnalysisResult> AnalyzeAsync(
+        AnalysisRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        // Validate request
+        var validationResult = _validator.Validate(request);
+        if (!validationResult.IsValid)
+        {
+            var errorMessage = string.Join("; ", validationResult.Errors);
+            _logger.LogWarning("Analysis request validation failed: {Errors}", errorMessage);
+            throw new ValidationException("VALIDATION_FAILED", errorMessage);
+        }
+
+        // Generate analysis ID upfront for event correlation
+        var analysisId = Guid.NewGuid();
+
+        _logger.LogInformation(
+            "Starting prompt analysis: AnalysisId={AnalysisId}, PromptLength={Length}, UserId={UserId}, ConversationId={ConversationId}",
+            analysisId,
+            request.Prompt.Length,
+            request.Metadata?.UserId,
+            request.Metadata?.ConversationId);
+
+        // Raise AnalysisStarted event BEFORE pipeline execution
+        await RaiseAnalysisStartedAsync(analysisId, request, cancellationToken);
+
+        AnalysisResult result;
+        try
+        {
+            // Execute pipeline with the pre-generated analysis ID
+            result = await _pipeline.ExecuteAsync(request, analysisId, cancellationToken);
+
+            _logger.LogInformation(
+                "Analysis completed: AnalysisId={AnalysisId}, IsThreat={IsThreat}, Confidence={Confidence:F3}, Duration={Duration}ms",
+                result.AnalysisId,
+                result.IsThreat,
+                result.Confidence,
+                result.Duration.TotalMilliseconds);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogWarning("Analysis cancelled: AnalysisId={AnalysisId}", analysisId);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Analysis failed: AnalysisId={AnalysisId}", analysisId);
+
+            // Check failure behavior
+            if (_options.OnAnalysisError == FailureBehavior.FailClosed)
+            {
+                throw new PromptShieldException(
+                    "Prompt analysis failed. The prompt has been blocked for security. See inner exception for details.",
+                    ex);
+            }
+
+            // Fail-open: create a "safe" result with warning
+            _logger.LogWarning(
+                "Returning safe result due to fail-open configuration. AnalysisId={AnalysisId}",
+                analysisId);
+
+            return CreateFailOpenResult(analysisId, request);
+        }
+
+        // Raise threat detection event if applicable
+        if (result.IsThreat && result.ThreatInfo != null)
+        {
+            await RaiseThreatDetectedAsync(request, result, cancellationToken);
+        }
+
+        // Raise AnalysisCompleted event
+        await RaiseAnalysisCompletedAsync(request, result, cancellationToken);
+
+        return result;
+    }
+
+    private AnalysisResult CreateFailOpenResult(Guid analysisId, AnalysisRequest request)
+    {
+        return new AnalysisResult
+        {
+            AnalysisId = analysisId,
+            IsThreat = false,
+            Confidence = 0.0,
+            ThreatInfo = null,
+            Breakdown = new DetectionBreakdown
+            {
+                PatternMatching = CreateErrorLayerResult("PatternMatching"),
+                Heuristics = CreateErrorLayerResult("Heuristics"),
+                MLClassification = null,
+                SemanticAnalysis = null,
+                ExecutedLayers = new List<string>()
+            },
+            DecisionLayer = "FailOpen",
+            Duration = TimeSpan.Zero,
+            Timestamp = DateTimeOffset.UtcNow
+        };
+    }
+
+    private static LayerResult CreateErrorLayerResult(string layerName)
+    {
+        return new LayerResult
+        {
+            LayerName = layerName,
+            WasExecuted = false,
+            Data = new Dictionary<string, object> { ["error"] = "Analysis failed - fail-open mode" }
+        };
+    }
+
+    private async Task RaiseAnalysisStartedAsync(
+        Guid analysisId,
+        AnalysisRequest request,
+        CancellationToken cancellationToken)
+    {
+        var @event = new AnalysisStartedEvent
+        {
+            AnalysisId = analysisId,
+            Request = request,
+            Timestamp = DateTimeOffset.UtcNow
+        };
+
+        foreach (var handler in _eventHandlers)
+        {
+            try
+            {
+                await handler.OnAnalysisStartedAsync(@event, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogDebug("Event handler cancelled during AnalysisStarted");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Event handler {HandlerType} failed on AnalysisStarted",
+                    handler.GetType().Name);
+                // Continue with other handlers - event handler failure should not block analysis
+            }
+        }
+    }
+
+    private async Task RaiseThreatDetectedAsync(
+        AnalysisRequest request,
+        AnalysisResult result,
+        CancellationToken cancellationToken)
+    {
+        var @event = new ThreatDetectedEvent
+        {
+            AnalysisId = result.AnalysisId,
+            Request = request,
+            ThreatInfo = result.ThreatInfo!,
+            DetectionLayer = result.DecisionLayer,
+            Timestamp = result.Timestamp
+        };
+
+        foreach (var handler in _eventHandlers)
+        {
+            try
+            {
+                await handler.OnThreatDetectedAsync(@event, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogDebug("Event handler cancelled during ThreatDetected");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Event handler {HandlerType} failed on ThreatDetected",
+                    handler.GetType().Name);
+                // Continue with other handlers
+            }
+        }
+    }
+
+    private async Task RaiseAnalysisCompletedAsync(
+        AnalysisRequest request,
+        AnalysisResult result,
+        CancellationToken cancellationToken)
+    {
+        var @event = new AnalysisCompletedEvent
+        {
+            Result = result,
+            Request = request,
+            Timestamp = result.Timestamp
+        };
+
+        foreach (var handler in _eventHandlers)
+        {
+            try
+            {
+                await handler.OnAnalysisCompletedAsync(@event, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogDebug("Event handler cancelled during AnalysisCompleted");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Event handler {HandlerType} failed on AnalysisCompleted",
+                    handler.GetType().Name);
+                // Continue with other handlers
+            }
+        }
+    }
+}

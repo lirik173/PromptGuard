@@ -1,0 +1,20 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\PromptShield.Abstractions\PromptShield.Abstractions.csproj" />
+    <ProjectReference Include="..\PromptShield.Core\PromptShield.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Description>ASP.NET Core middleware integration for PromptShield - Enterprise-grade Prompt Injection Firewall</Description>
+    <PackageTags>$(PackageTags);aspnetcore;middleware</PackageTags>
+  </PropertyGroup>
+
+</Project>

@@ -1,0 +1,94 @@
+# .NET Build Outputs
+bin/
+obj/
+*.dll
+*.exe
+*.pdb
+*.deps.json
+*.runtimeconfig.json
+*.xml
+*.cache
+project.assets.json
+project.nuget.cache
+*.nuget.dgspec.json
+*.nuget.g.props
+*.nuget.g.targets
+.specify/
+specs/
+.cursor/
+packages/
+
+# Visual Studio / Rider
+.vs/
+.vscode/
+.idea/
+*.csproj.user
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.swp
+*~
+*.rsuser
+*.userprefs
+*.DotSettings.user
+*.sln.iml
+*.iml
+
+# Test Results
+TestResults/
+*.trx
+*.coveragexml
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+
+# Build Results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+*.pfx
+*.key
+secrets/
+appsettings.*.json
+!appsettings.json
+!appsettings.Development.json
+
+# OS Files
+.DS_Store
+Thumbs.db
+*.tmp
+*.log
+desktop.ini
+$RECYCLE.BIN/
+
+# BenchmarkDotNet
+BenchmarkDotNet.Artifacts/
+
+# Code Coverage
+coverage/
+*.coverage
+coverage.*.json
+*.lcov
+
+# Keep important files
+!LICENSE
+!.gitignore
+!.editorconfig
+!Directory.Build.props
