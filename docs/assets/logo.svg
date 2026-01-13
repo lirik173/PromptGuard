@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <defs>
+    <linearGradient id="shieldGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#6366F1;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#8B5CF6;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="innerGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#A5B4FC;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#C4B5FD;stop-opacity:1" />
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#6366F1" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+  
+  <!-- Main shield shape -->
+  <path d="M100 15 L175 45 L175 95 C175 140 145 175 100 190 C55 175 25 140 25 95 L25 45 Z" 
+        fill="url(#shieldGradient)" 
+        filter="url(#shadow)"/>
+  
+  <!-- Inner shield highlight -->
+  <path d="M100 30 L160 55 L160 95 C160 130 135 160 100 172 C65 160 40 130 40 95 L40 55 Z" 
+        fill="url(#innerGradient)" 
+        opacity="0.3"/>
+  
+  <!-- Checkmark / lock symbol -->
+  <g transform="translate(100, 100)">
+    <!-- Lock body -->
+    <rect x="-25" y="-10" width="50" height="40" rx="5" fill="white" opacity="0.95"/>
+    <!-- Lock shackle -->
+    <path d="M-15 -10 L-15 -25 C-15 -40 15 -40 15 -25 L15 -10" 
+          fill="none" 
+          stroke="white" 
+          stroke-width="8" 
+          stroke-linecap="round"
+          opacity="0.95"/>
+    <!-- Keyhole -->
+    <circle cx="0" cy="8" r="6" fill="url(#shieldGradient)"/>
+    <rect x="-3" y="8" width="6" height="12" rx="2" fill="url(#shieldGradient)"/>
+  </g>
+  
+  <!-- Decorative AI/neural network dots -->
+  <g fill="#A5B4FC" opacity="0.6">
+    <circle cx="55" cy="70" r="3"/>
+    <circle cx="145" cy="70" r="3"/>
+    <circle cx="45" cy="110" r="2"/>
+    <circle cx="155" cy="110" r="2"/>
+    <circle cx="60" cy="145" r="2"/>
+    <circle cx="140" cy="145" r="2"/>
+  </g>
+</svg>
