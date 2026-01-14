@@ -49,6 +49,7 @@ public class PipelineOrchestratorTests
         return new PipelineOrchestrator(
             patternLayer,
             heuristicLayer,
+            mlLayer: null,
             opts,
             NullLogger<PipelineOrchestrator>.Instance);
     }

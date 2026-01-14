@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using PromptShield.Abstractions.Analysis;
 using PromptShield.Abstractions.Configuration;
+using PromptShield.Core.Analysis;
 using PromptShield.Core.Layers;
 
 namespace PromptShield.Core.Pipeline;
@@ -10,21 +11,54 @@ namespace PromptShield.Core.Pipeline;
 /// <summary>
 /// Orchestrates the multi-layer detection pipeline with early exit optimization.
 /// </summary>
+/// <remarks>
+/// <para>Pipeline execution flow:</para>
+/// <list type="number">
+///   <item><b>Language Filter</b>: Gate - blocks unsupported languages</item>
+///   <item><b>Pattern Matching</b>: Fast regex-based detection</item>
+///   <item><b>Heuristics</b>: Statistical and structural analysis</item>
+///   <item><b>ML Classification</b>: Model-based prediction</item>
+/// </list>
+/// <para>
+/// All detection layers require language-specific patterns/vocabulary.
+/// By default, only English is supported. Add patterns for other languages
+/// via <see cref="PromptShield.Abstractions.Detection.Patterns.IPatternProvider"/>.
+/// </para>
+/// </remarks>
 public sealed class PipelineOrchestrator
 {
     private readonly PromptShieldOptions _options;
+    private readonly LanguageFilterLayer? _languageFilterLayer;
     private readonly PatternMatchingLayer _patternLayer;
     private readonly HeuristicLayer _heuristicLayer;
+    private readonly MLClassificationLayer? _mlLayer;
+    private readonly SemanticAnalysisLayer? _semanticLayer;
     private readonly ILogger<PipelineOrchestrator> _logger;
 
     public PipelineOrchestrator(
         PatternMatchingLayer patternLayer,
         HeuristicLayer heuristicLayer,
+        MLClassificationLayer? mlLayer,
+        PromptShieldOptions options,
+        ILogger<PipelineOrchestrator>? logger = null)
+        : this(null, patternLayer, heuristicLayer, mlLayer, null, options, logger)
+    {
+    }
+
+    public PipelineOrchestrator(
+        LanguageFilterLayer? languageFilterLayer,
+        PatternMatchingLayer patternLayer,
+        HeuristicLayer heuristicLayer,
+        MLClassificationLayer? mlLayer,
+        SemanticAnalysisLayer? semanticLayer,
         PromptShieldOptions options,
         ILogger<PipelineOrchestrator>? logger = null)
     {
+        _languageFilterLayer = languageFilterLayer;
         _patternLayer = patternLayer ?? throw new ArgumentNullException(nameof(patternLayer));
         _heuristicLayer = heuristicLayer ?? throw new ArgumentNullException(nameof(heuristicLayer));
+        _mlLayer = mlLayer;
+        _semanticLayer = semanticLayer;
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? NullLogger<PipelineOrchestrator>.Instance;
     }
@@ -32,10 +66,6 @@ public sealed class PipelineOrchestrator
     /// <summary>
     /// Executes the detection pipeline with early exit optimization.
     /// </summary>
-    /// <param name="request">The analysis request.</param>
-    /// <param name="analysisId">Pre-generated analysis ID for event correlation.</param>
-    /// <param name="cancellationToken">Cancellation token.</param>
-    /// <returns>Analysis result.</returns>
     public async Task<AnalysisResult> ExecuteAsync(
         AnalysisRequest request,
         Guid analysisId,
@@ -44,6 +74,7 @@ public sealed class PipelineOrchestrator
         var timestamp = DateTimeOffset.UtcNow;
         var overallStopwatch = Stopwatch.StartNew();
         var executedLayers = new List<string>();
+        LanguageFilterResult? languageFilterResult = null;
 
         _logger.LogInformation(
             "Starting analysis pipeline for AnalysisId={AnalysisId}, PromptLength={Length}",
@@ -52,7 +83,40 @@ public sealed class PipelineOrchestrator
 
         try
         {
-            // Layer 1: Pattern Matching (always executed)
+            // Layer 0: Language Filter (gate)
+            if (_languageFilterLayer != null && _options.Language.Enabled)
+            {
+                languageFilterResult = await _languageFilterLayer.AnalyzeAsync(
+                    request.Prompt,
+                    cancellationToken);
+
+                if (languageFilterResult.WasExecuted)
+                {
+                    executedLayers.Add(_languageFilterLayer.LayerName);
+
+                    _logger.LogDebug(
+                        "Language filter: ShouldProceed={ShouldProceed}, Language={Language}",
+                        languageFilterResult.ShouldProceed,
+                        languageFilterResult.LanguageResult?.LanguageName ?? "unknown");
+
+                    // Block if language not supported
+                    if (!languageFilterResult.ShouldProceed && languageFilterResult.IsBlocked)
+                    {
+                        _logger.LogInformation(
+                            "Request blocked by language filter: {Message}",
+                            languageFilterResult.Message);
+
+                        return CreateLanguageBlockResult(
+                            analysisId,
+                            timestamp,
+                            overallStopwatch,
+                            languageFilterResult,
+                            executedLayers);
+                    }
+                }
+            }
+
+            // Layer 1: Pattern Matching
             LayerResult patternResult;
             try
             {
@@ -60,27 +124,26 @@ public sealed class PipelineOrchestrator
                 executedLayers.Add(_patternLayer.LayerName);
 
                 _logger.LogDebug(
-                    "Pattern matching completed: IsThreat={IsThreat}, Confidence={Confidence:F3}, Duration={Duration}ms",
+                    "Pattern matching: IsThreat={IsThreat}, Confidence={Confidence:P0}",
                     patternResult.IsThreat,
-                    patternResult.Confidence,
-                    patternResult.Duration?.TotalMilliseconds);
+                    patternResult.Confidence);
 
                 // Early exit on high-confidence pattern match
                 if (patternResult.IsThreat == true &&
                     patternResult.Confidence >= _options.PatternMatching.EarlyExitThreshold)
                 {
                     _logger.LogInformation(
-                        "Early exit triggered by pattern matching (Confidence={Confidence:F3})",
+                        "Early exit: pattern matching (Confidence={Confidence:P0})",
                         patternResult.Confidence);
 
                     return CreateResult(
                         analysisId,
                         timestamp,
                         overallStopwatch,
+                        languageFilterResult,
                         patternResult,
                         heuristicResult: null,
                         mlResult: null,
-                        semanticResult: null,
                         executedLayers,
                         _patternLayer.LayerName);
                 }
@@ -95,7 +158,7 @@ public sealed class PipelineOrchestrator
                 patternResult = CreateFailedLayerResult(_patternLayer.LayerName);
             }
 
-            // Layer 2: Heuristic Analysis (always executed)
+            // Layer 2: Heuristic Analysis
             LayerResult heuristicResult;
             try
             {
@@ -106,17 +169,16 @@ public sealed class PipelineOrchestrator
                 executedLayers.Add(_heuristicLayer.LayerName);
 
                 _logger.LogDebug(
-                    "Heuristic analysis completed: IsThreat={IsThreat}, Confidence={Confidence:F3}, Duration={Duration}ms",
+                    "Heuristics: IsThreat={IsThreat}, Confidence={Confidence:P0}",
                     heuristicResult.IsThreat,
-                    heuristicResult.Confidence,
-                    heuristicResult.Duration?.TotalMilliseconds);
+                    heuristicResult.Confidence);
 
                 // Early exit on definitive heuristic result
                 if (_heuristicLayer.IsDefinitiveResult(heuristicResult))
                 {
-                    var reason = heuristicResult.IsThreat == true ? "definitive threat" : "definitive safe";
+                    var reason = heuristicResult.IsThreat == true ? "threat" : "safe";
                     _logger.LogInformation(
-                        "Early exit triggered by heuristics: {Reason} (Confidence={Confidence:F3})",
+                        "Early exit: heuristics definitive {Reason} (Confidence={Confidence:P0})",
                         reason,
                         heuristicResult.Confidence);
 
@@ -124,10 +186,10 @@ public sealed class PipelineOrchestrator
                         analysisId,
                         timestamp,
                         overallStopwatch,
+                        languageFilterResult,
                         patternResult,
                         heuristicResult,
                         mlResult: null,
-                        semanticResult: null,
                         executedLayers,
                         _heuristicLayer.LayerName);
                 }
@@ -142,23 +204,75 @@ public sealed class PipelineOrchestrator
                 heuristicResult = CreateFailedLayerResult(_heuristicLayer.LayerName);
             }
 
-            // For MVP (US1), we only have Pattern + Heuristic layers
-            // ML and Semantic layers will be added in later user stories (US4, US6)
+            // Layer 3: ML Classification (conditional)
+            LayerResult? mlResult = null;
+            if (_mlLayer != null && _options.ML.Enabled)
+            {
+                var combinedConfidence = CalculateCombinedConfidence(patternResult, heuristicResult);
+                var shouldSkipML = combinedConfidence < _options.ML.Threshold * 0.5;
 
-            // Final decision: aggregate pattern and heuristic results
+                if (!shouldSkipML)
+                {
+                    try
+                    {
+                        mlResult = await _mlLayer.AnalyzeAsync(request.Prompt, cancellationToken);
+                        executedLayers.Add(_mlLayer.LayerName);
+
+                        _logger.LogDebug(
+                            "ML classification: IsThreat={IsThreat}, Confidence={Confidence:P0}",
+                            mlResult.IsThreat,
+                            mlResult.Confidence);
+
+                        // Early exit on high-confidence ML detection
+                        if (mlResult.IsThreat == true && mlResult.Confidence >= _options.ML.Threshold)
+                        {
+                            _logger.LogInformation(
+                                "Early exit: ML classification (Confidence={Confidence:P0})",
+                                mlResult.Confidence);
+
+                            return CreateResult(
+                                analysisId,
+                                timestamp,
+                                overallStopwatch,
+                                languageFilterResult,
+                                patternResult,
+                                heuristicResult,
+                                mlResult,
+                                executedLayers,
+                                _mlLayer.LayerName);
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "ML classification layer failed");
+                        mlResult = CreateFailedLayerResult(_mlLayer.LayerName);
+                    }
+                }
+                else
+                {
+                    _logger.LogDebug("Skipping ML layer: low combined risk");
+                }
+            }
+
+            // Final aggregated result
             overallStopwatch.Stop();
 
             var finalResult = CreateAggregatedResult(
                 analysisId,
                 timestamp,
                 overallStopwatch,
+                languageFilterResult,
                 patternResult,
                 heuristicResult,
+                mlResult,
                 executedLayers);
 
             _logger.LogInformation(
-                "Analysis completed: AnalysisId={AnalysisId}, IsThreat={IsThreat}, Confidence={Confidence:F3}, Duration={Duration}ms",
-                analysisId,
+                "Analysis completed: IsThreat={IsThreat}, Confidence={Confidence:P0}, Duration={Duration}ms",
                 finalResult.IsThreat,
                 finalResult.Confidence,
                 finalResult.Duration.TotalMilliseconds);
@@ -167,12 +281,12 @@ public sealed class PipelineOrchestrator
         }
         catch (OperationCanceledException)
         {
-            _logger.LogWarning("Pipeline execution cancelled: AnalysisId={AnalysisId}", analysisId);
+            _logger.LogWarning("Pipeline cancelled: AnalysisId={AnalysisId}", analysisId);
             throw;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Pipeline execution failed: AnalysisId={AnalysisId}", analysisId);
+            _logger.LogError(ex, "Pipeline failed: AnalysisId={AnalysisId}", analysisId);
             throw;
         }
     }
@@ -181,29 +295,28 @@ public sealed class PipelineOrchestrator
         Guid analysisId,
         DateTimeOffset timestamp,
         Stopwatch stopwatch,
+        LanguageFilterResult? languageFilterResult,
         LayerResult patternResult,
         LayerResult? heuristicResult,
         LayerResult? mlResult,
-        LayerResult? semanticResult,
         List<string> executedLayers,
         string decisionLayer)
     {
         stopwatch.Stop();
 
-        // Determine the primary decision maker
         var (isThreat, confidence, threatInfo) = DetermineThreat(
             patternResult,
             heuristicResult,
             mlResult,
-            semanticResult,
             decisionLayer);
 
         var breakdown = new DetectionBreakdown
         {
+            LanguageFilter = languageFilterResult?.ToLayerResult(),
             PatternMatching = patternResult,
             Heuristics = heuristicResult ?? CreateSkippedLayerResult("Heuristics"),
             MLClassification = mlResult,
-            SemanticAnalysis = semanticResult,
+            SemanticAnalysis = null,
             ExecutedLayers = executedLayers
         };
 
@@ -224,24 +337,31 @@ public sealed class PipelineOrchestrator
         Guid analysisId,
         DateTimeOffset timestamp,
         Stopwatch stopwatch,
+        LanguageFilterResult? languageFilterResult,
         LayerResult patternResult,
         LayerResult heuristicResult,
+        LayerResult? mlResult,
         List<string> executedLayers)
     {
-        // Use configured weights for aggregation
         var patternWeight = _options.Aggregation.PatternMatchingWeight;
         var heuristicWeight = _options.Aggregation.HeuristicsWeight;
+        var mlWeight = _options.Aggregation.MLClassificationWeight;
 
         var patternConfidence = patternResult.Confidence ?? 0.0;
         var heuristicConfidence = heuristicResult.Confidence ?? 0.0;
+        var mlConfidence = mlResult?.Confidence ?? 0.0;
 
-        // Normalize weights
-        var totalWeight = patternWeight + heuristicWeight;
+        var totalWeight = patternWeight;
+        if (heuristicResult.WasExecuted) totalWeight += heuristicWeight;
+        if (mlResult is { WasExecuted: true }) totalWeight += mlWeight;
+
         var normalizedPatternWeight = patternWeight / totalWeight;
-        var normalizedHeuristicWeight = heuristicWeight / totalWeight;
+        var normalizedHeuristicWeight = heuristicResult.WasExecuted ? heuristicWeight / totalWeight : 0.0;
+        var normalizedMLWeight = mlResult is { WasExecuted: true } ? mlWeight / totalWeight : 0.0;
 
         var aggregateConfidence = (patternConfidence * normalizedPatternWeight) +
-                                  (heuristicConfidence * normalizedHeuristicWeight);
+                                  (heuristicConfidence * normalizedHeuristicWeight) +
+                                  (mlConfidence * normalizedMLWeight);
         aggregateConfidence = Math.Clamp(aggregateConfidence, 0.0, 1.0);
 
         var isThreat = aggregateConfidence >= _options.ThreatThreshold;
@@ -249,14 +369,15 @@ public sealed class PipelineOrchestrator
         ThreatInfo? threatInfo = null;
         if (isThreat)
         {
-            threatInfo = BuildThreatInfo(patternResult, heuristicResult, aggregateConfidence);
+            threatInfo = ThreatInfoBuilder.Build(patternResult, heuristicResult, mlResult, aggregateConfidence);
         }
 
         var breakdown = new DetectionBreakdown
         {
+            LanguageFilter = languageFilterResult?.ToLayerResult(),
             PatternMatching = patternResult,
             Heuristics = heuristicResult,
-            MLClassification = null,
+            MLClassification = mlResult,
             SemanticAnalysis = null,
             ExecutedLayers = executedLayers
         };
@@ -274,136 +395,108 @@ public sealed class PipelineOrchestrator
         };
     }
 
-    private ThreatInfo BuildThreatInfo(
-        LayerResult patternResult,
-        LayerResult heuristicResult,
-        double aggregateConfidence)
+    private AnalysisResult CreateLanguageBlockResult(
+        Guid analysisId,
+        DateTimeOffset timestamp,
+        Stopwatch stopwatch,
+        LanguageFilterResult languageResult,
+        List<string> executedLayers)
     {
-        var owaspCategory = "LLM01"; // Default
-        var matchedPatterns = new List<string>();
-        var detectionSources = new List<string>();
+        stopwatch.Stop();
 
-        if (patternResult.IsThreat == true && patternResult.Data != null)
+        var detectedLanguage = languageResult.LanguageResult?.LanguageName ?? "Unknown";
+        var supportedLanguages = string.Join(", ", _options.Language.SupportedLanguages);
+
+        var threatInfo = new ThreatInfo
         {
-            if (patternResult.Data.TryGetValue("owasp_category", out var category))
-            {
-                owaspCategory = category.ToString() ?? "LLM01";
-            }
-            if (patternResult.Data.TryGetValue("matched_patterns", out var patterns) &&
-                patterns is List<string> patternList)
-            {
-                matchedPatterns.AddRange(patternList);
-            }
-            detectionSources.Add("PatternMatching");
-        }
-
-        if (heuristicResult.IsThreat == true)
-        {
-            detectionSources.Add("Heuristics");
-        }
-
-        var severity = aggregateConfidence.ToSeverity();
-
-        return new ThreatInfo
-        {
-            OwaspCategory = owaspCategory,
-            ThreatType = "Prompt Injection",
-            Explanation = $"Potential prompt injection detected with confidence {aggregateConfidence:P0}. " +
-                         $"Detected by: {string.Join(", ", detectionSources)}.",
-            UserFacingMessage = "Your request could not be processed due to security concerns. " +
-                               "Please rephrase your message and try again.",
-            Severity = severity,
-            DetectionSources = detectionSources,
-            MatchedPatterns = matchedPatterns.Count > 0 ? matchedPatterns : null
-        };
-    }
-
-    private (bool isThreat, double confidence, ThreatInfo? threatInfo) DetermineThreat(
-        LayerResult patternResult,
-        LayerResult? heuristicResult,
-        LayerResult? mlResult,
-        LayerResult? semanticResult,
-        string decisionLayer)
-    {
-        // For early exit scenarios, use the layer that triggered the exit
-        var decidingResult = decisionLayer switch
-        {
-            "PatternMatching" => patternResult,
-            "Heuristics" => heuristicResult,
-            "MLClassification" => mlResult,
-            "SemanticAnalysis" => semanticResult,
-            _ => patternResult
+            OwaspCategory = "LLM01",
+            ThreatType = "Unsupported Language",
+            Explanation = $"Input language '{detectedLanguage}' is not supported. Supported languages: [{supportedLanguages}].",
+            UserFacingMessage = $"Please submit your request in a supported language ({supportedLanguages}).",
+            Severity = ThreatSeverity.Medium,
+            DetectionSources = ["LanguageFilter"]
         };
 
-        if (decidingResult == null)
+        var breakdown = new DetectionBreakdown
         {
-            return (false, 0.0, null);
-        }
-
-        var isThreat = decidingResult.IsThreat ?? false;
-        var confidence = decidingResult.Confidence ?? 0.0;
-
-        ThreatInfo? threatInfo = null;
-        if (isThreat && decidingResult.Data != null)
-        {
-            var owaspCategory = decidingResult.Data.TryGetValue("owasp_category", out var cat)
-                ? cat.ToString() ?? "LLM01"
-                : "LLM01";
-
-            var matchedPatterns = decidingResult.Data.TryGetValue("matched_patterns", out var patterns) &&
-                                  patterns is List<string> patternList
-                ? patternList
-                : null;
-
-            var severity = confidence.ToSeverity();
-
-            threatInfo = new ThreatInfo
-            {
-                OwaspCategory = owaspCategory,
-                ThreatType = "Prompt Injection",
-                Explanation = $"Threat detected by {decisionLayer} layer with {confidence:P0} confidence.",
-                UserFacingMessage = "Your request could not be processed due to security concerns. " +
-                                   "Please rephrase your message and try again.",
-                Severity = severity,
-                DetectionSources = new[] { decisionLayer },
-                MatchedPatterns = matchedPatterns
-            };
-        }
-
-        return (isThreat, confidence, threatInfo);
-    }
-
-    private static LayerResult CreateFailedLayerResult(string layerName)
-    {
-        return new LayerResult
-        {
-            LayerName = layerName,
-            WasExecuted = true,
-            Confidence = 0.0,
-            IsThreat = false,
-            Duration = TimeSpan.Zero,
-            Data = new Dictionary<string, object> { ["error"] = "Layer execution failed" }
-        };
-    }
-
-    private static LayerResult CreateSkippedLayerResult(string layerName)
-    {
-        return new LayerResult
-        {
-            LayerName = layerName,
-            WasExecuted = false
-        };
-    }
-
-    private static DetectionBreakdown CreateMinimalBreakdown(List<string> executedLayers)
-    {
-        return new DetectionBreakdown
-        {
+            LanguageFilter = languageResult.ToLayerResult(),
             PatternMatching = CreateSkippedLayerResult("PatternMatching"),
             Heuristics = CreateSkippedLayerResult("Heuristics"),
             MLClassification = null,
             SemanticAnalysis = null,
             ExecutedLayers = executedLayers
         };
+
+        return new AnalysisResult
+        {
+            AnalysisId = analysisId,
+            IsThreat = true,
+            Confidence = languageResult.BlockConfidence,
+            ThreatInfo = threatInfo,
+            Breakdown = _options.IncludeBreakdown ? breakdown : CreateMinimalBreakdown(executedLayers),
+            DecisionLayer = "LanguageFilter",
+            Duration = stopwatch.Elapsed,
+            Timestamp = timestamp
+        };
     }
+
+    private static double CalculateCombinedConfidence(LayerResult patternResult, LayerResult heuristicResult)
+    {
+        var patternConfidence = patternResult.Confidence ?? 0.0;
+        var heuristicConfidence = heuristicResult.Confidence ?? 0.0;
+        return (patternConfidence + heuristicConfidence) / 2.0;
+    }
+
+    private (bool isThreat, double confidence, ThreatInfo? threatInfo) DetermineThreat(
+        LayerResult patternResult,
+        LayerResult? heuristicResult,
+        LayerResult? mlResult,
+        string decisionLayer)
+    {
+        var decidingResult = decisionLayer switch
+        {
+            "PatternMatching" => patternResult,
+            "Heuristics" => heuristicResult,
+            "MLClassification" => mlResult,
+            _ => patternResult
+        };
+
+        if (decidingResult == null) return (false, 0.0, null);
+
+        var isThreat = decidingResult.IsThreat ?? false;
+        var confidence = decidingResult.Confidence ?? 0.0;
+
+        ThreatInfo? threatInfo = null;
+        if (isThreat)
+        {
+            threatInfo = ThreatInfoBuilder.BuildFromSingleLayer(decidingResult, decisionLayer, confidence);
+        }
+
+        return (isThreat, confidence, threatInfo);
+    }
+
+    private static LayerResult CreateFailedLayerResult(string layerName) => new()
+    {
+        LayerName = layerName,
+        WasExecuted = true,
+        Confidence = 0.0,
+        IsThreat = false,
+        Duration = TimeSpan.Zero,
+        Data = new Dictionary<string, object> { ["error"] = "Layer execution failed" }
+    };
+
+    private static LayerResult CreateSkippedLayerResult(string layerName) => new()
+    {
+        LayerName = layerName,
+        WasExecuted = false
+    };
+
+    private static DetectionBreakdown CreateMinimalBreakdown(List<string> executedLayers) => new()
+    {
+        PatternMatching = CreateSkippedLayerResult("PatternMatching"),
+        Heuristics = CreateSkippedLayerResult("Heuristics"),
+        MLClassification = null,
+        SemanticAnalysis = null,
+        ExecutedLayers = executedLayers
+    };
 }

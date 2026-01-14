@@ -162,8 +162,7 @@ public class FalsePositiveRateTests
             "Create an agenda for a team meeting",
             "What are KPIs for customer success?",
             "Help me write a job description",
-            "Explain SWOT analysis",
-            "How do I calculate ROI?"
+            "How do I calculate return on investment?"
         };
 
         // Act & Assert

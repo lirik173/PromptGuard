@@ -32,6 +32,16 @@ public sealed class PromptShieldOptions
     public FailureBehavior OnAnalysisError { get; set; } = FailureBehavior.FailClosed;
 
     /// <summary>
+    /// Language detection and filtering configuration.
+    /// </summary>
+    /// <remarks>
+    /// <b>IMPORTANT:</b> PromptShield's rule-based detection (patterns, heuristics, ML)
+    /// is currently optimized for <b>English only</b>. Non-English prompts may bypass
+    /// these detection layers. Enable language filtering to mitigate this limitation.
+    /// </remarks>
+    public LanguageOptions Language { get; set; } = new();
+
+    /// <summary>
     /// Pattern matching layer configuration.
     /// </summary>
     public PatternMatchingOptions PatternMatching { get; set; } = new();

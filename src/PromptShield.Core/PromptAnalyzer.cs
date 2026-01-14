@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using PromptShield.Abstractions.Analyzers;
@@ -6,6 +7,7 @@ using PromptShield.Abstractions.Configuration;
 using PromptShield.Abstractions.Events;
 using PromptShield.Abstractions.Exceptions;
 using PromptShield.Core.Pipeline;
+using PromptShield.Core.Telemetry;
 using PromptShield.Core.Validation;
 
 namespace PromptShield.Core;
@@ -65,12 +67,28 @@ public sealed class PromptAnalyzer : IPromptAnalyzer
         // Generate analysis ID upfront for event correlation
         var analysisId = Guid.NewGuid();
 
+        // Start telemetry activity if enabled
+        using var activity = TelemetryHelper.StartActivity("PromptShield.Analyze", _options.Telemetry);
+        activity?.SetTag("analysis.id", analysisId.ToString());
+        activity?.SetTag("prompt.length", request.Prompt.Length);
+        if (request.Metadata?.UserId != null)
+        {
+            activity?.SetTag("user.id", request.Metadata.UserId);
+        }
+
         _logger.LogInformation(
             "Starting prompt analysis: AnalysisId={AnalysisId}, PromptLength={Length}, UserId={UserId}, ConversationId={ConversationId}",
             analysisId,
             request.Prompt.Length,
             request.Metadata?.UserId,
             request.Metadata?.ConversationId);
+
+        // Emit metrics if enabled
+        if (TelemetryHelper.ShouldEmitTelemetry(_options.Telemetry))
+        {
+            PromptShieldTelemetry.AnalysisTotal.Add(1);
+            PromptShieldTelemetry.PromptLength.Record(request.Prompt.Length);
+        }
 
         // Raise AnalysisStarted event BEFORE pipeline execution
         await RaiseAnalysisStartedAsync(analysisId, request, cancellationToken);
@@ -80,6 +98,27 @@ public sealed class PromptAnalyzer : IPromptAnalyzer
         {
             // Execute pipeline with the pre-generated analysis ID
             result = await _pipeline.ExecuteAsync(request, analysisId, cancellationToken);
+
+            // Emit metrics
+            if (TelemetryHelper.ShouldEmitTelemetry(_options.Telemetry))
+            {
+                PromptShieldTelemetry.AnalysisLatency.Record(result.Duration.TotalMilliseconds);
+                
+                if (result.IsThreat)
+                {
+                    PromptShieldTelemetry.ThreatsDetected.Add(1);
+                    activity?.SetTag("threat.detected", true);
+                    activity?.SetTag("threat.confidence", result.Confidence);
+                    activity?.SetTag("threat.owasp_category", result.ThreatInfo?.OwaspCategory ?? "unknown");
+                }
+                else
+                {
+                    activity?.SetTag("threat.detected", false);
+                }
+            }
+
+            activity?.SetTag("analysis.confidence", result.Confidence);
+            activity?.SetTag("analysis.decision_layer", result.DecisionLayer);
 
             _logger.LogInformation(
                 "Analysis completed: AnalysisId={AnalysisId}, IsThreat={IsThreat}, Confidence={Confidence:F3}, Duration={Duration}ms",
@@ -91,11 +130,23 @@ public sealed class PromptAnalyzer : IPromptAnalyzer
         catch (OperationCanceledException)
         {
             _logger.LogWarning("Analysis cancelled: AnalysisId={AnalysisId}", analysisId);
+            activity?.SetStatus(ActivityStatusCode.Error, "Cancelled");
             throw;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Analysis failed: AnalysisId={AnalysisId}", analysisId);
+
+            // Emit error metric
+            if (TelemetryHelper.ShouldEmitTelemetry(_options.Telemetry))
+            {
+                PromptShieldTelemetry.AnalysisErrors.Add(1);
+            }
+
+            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            // Note: RecordException is an OpenTelemetry extension, not available in base Activity
+            activity?.SetTag("exception.type", ex.GetType().FullName);
+            activity?.SetTag("exception.message", ex.Message);
 
             // Check failure behavior
             if (_options.OnAnalysisError == FailureBehavior.FailClosed)
