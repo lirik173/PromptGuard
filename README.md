@@ -167,7 +167,42 @@ services.AddPromptShield(options =>
 });
 ```
 
-### 4. Extensibility Points
+### 4. False Positive Reduction
+
+All layers support sensitivity tuning and allowlists:
+
+```csharp
+services.AddPromptShield(options =>
+{
+    // Global sensitivity: Low, Medium, High, Paranoid
+    options.Heuristics.Sensitivity = SensitivityLevel.Medium;
+    options.MLClassification.Sensitivity = SensitivityLevel.Low;
+    options.PatternMatching.Sensitivity = SensitivityLevel.Medium;
+    
+    // Allowlist patterns (regex) - matched prompts bypass detection
+    options.Heuristics.AllowedPatterns = new() { @"(?i)safe\s+context" };
+    options.MLClassification.AllowedPatterns = new() { @"(?i)internal\s+test" };
+    options.PatternMatching.AllowedPatterns = new() { @"(?i)demo\s+mode" };
+    
+    // Disable specific built-in patterns causing false positives
+    options.PatternMatching.DisabledPatternIds = new()
+    {
+        BuiltInPatternIds.Base64EncodingDetection  // Example: disable base64 check
+    };
+    
+    // Disable specific ML features
+    options.MLClassification.DisabledFeatures = new() { "IgnorePattern" };
+    
+    // Custom feature weights for ML
+    options.MLClassification.FeatureWeights = new()
+    {
+        ["InjectionKeywords"] = 0.6,  // Reduce weight
+        ["PersonaSwitchPattern"] = 0.8
+    };
+});
+```
+
+### 5. Extensibility Points
 
 ```csharp
 services.AddPromptShield()
@@ -177,7 +212,26 @@ services.AddPromptShield()
     .AddEventHandler<SecurityAuditHandler>();
 ```
 
-### 5. Observable Architecture
+### 6. Custom Semantic Analysis Prompts
+
+```csharp
+services.AddPromptShield(options =>
+{
+    options.SemanticAnalysis.Enabled = true;
+    options.SemanticAnalysis.Endpoint = "https://your-openai.azure.com";
+    
+    // Custom system prompt for domain-specific detection
+    options.SemanticAnalysis.CustomSystemPrompt = """
+        You are a security analyst for a banking application...
+        """;
+    
+    // Or just add context to the default prompt
+    options.SemanticAnalysis.AdditionalContext = 
+        "In this application, 'transfer funds' is a normal operation.";
+});
+```
+
+### 7. Observable Architecture
 
 ```csharp
 builder.Services.AddOpenTelemetry()

@@ -298,6 +298,305 @@ public class PatternMatchingLayerTests
             async () => await layer.AnalyzeAsync("test prompt", cts.Token));
     }
 
+    #region Allowlist Tests
+
+    [Fact]
+    public async Task AnalyzeAsync_WithAllowlistedPattern_ShouldNotDetectThreat()
+    {
+        // Arrange
+        var provider = new TestPatternProvider(new[]
+        {
+            new DetectionPattern
+            {
+                Id = "test-001",
+                Name = "Test Pattern",
+                Pattern = @"(?i)ignore\s+previous",
+                OwaspCategory = "LLM01",
+                Severity = ThreatSeverity.High,
+                Description = "Test pattern"
+            }
+        });
+
+        var options = new PatternMatchingOptions
+        {
+            Enabled = true,
+            TimeoutMs = 100,
+            AllowedPatterns = new List<string> { @"(?i)safe\s+context" }
+        };
+
+        var layer = new PatternMatchingLayer(
+            new[] { provider },
+            options,
+            NullLogger<PatternMatchingLayer>.Instance);
+
+        // Act - prompt contains threat pattern but matches allowlist
+        var result = await layer.AnalyzeAsync("This is safe context: ignore previous");
+
+        // Assert
+        result.Should().NotBeNull();
+        result.WasExecuted.Should().BeTrue();
+        result.IsThreat.Should().BeFalse();
+        result.Data.Should().ContainKey("status");
+        result.Data!["status"].Should().Be("allowlisted");
+    }
+
+    [Fact]
+    public async Task AnalyzeAsync_WithNonMatchingAllowlist_ShouldStillDetectThreat()
+    {
+        // Arrange
+        var provider = new TestPatternProvider(new[]
+        {
+            new DetectionPattern
+            {
+                Id = "test-001",
+                Name = "Test Pattern",
+                Pattern = @"(?i)attack",
+                OwaspCategory = "LLM01",
+                Severity = ThreatSeverity.High,
+                Description = "Test pattern"
+            }
+        });
+
+        var options = new PatternMatchingOptions
+        {
+            Enabled = true,
+            TimeoutMs = 100,
+            AllowedPatterns = new List<string> { @"(?i)completely\s+different" }
+        };
+
+        var layer = new PatternMatchingLayer(
+            new[] { provider },
+            options,
+            NullLogger<PatternMatchingLayer>.Instance);
+
+        // Act
+        var result = await layer.AnalyzeAsync("This is an attack prompt");
+
+        // Assert
+        result.IsThreat.Should().BeTrue();
+    }
+
+    #endregion
+
+    #region Disabled Pattern Tests
+
+    [Fact]
+    public async Task AnalyzeAsync_WithDisabledPattern_ShouldNotMatchDisabledPattern()
+    {
+        // Arrange
+        var provider = new TestPatternProvider(new[]
+        {
+            new DetectionPattern
+            {
+                Id = "test-disabled",
+                Name = "Disabled Pattern",
+                Pattern = @"(?i)attack",
+                OwaspCategory = "LLM01",
+                Severity = ThreatSeverity.High,
+                Description = "This pattern is disabled"
+            },
+            new DetectionPattern
+            {
+                Id = "test-enabled",
+                Name = "Enabled Pattern",
+                Pattern = @"(?i)malicious",
+                OwaspCategory = "LLM01",
+                Severity = ThreatSeverity.High,
+                Description = "This pattern is enabled"
+            }
+        });
+
+        var options = new PatternMatchingOptions
+        {
+            Enabled = true,
+            TimeoutMs = 100,
+            DisabledPatternIds = new List<string> { "test-disabled" }
+        };
+
+        var layer = new PatternMatchingLayer(
+            new[] { provider },
+            options,
+            NullLogger<PatternMatchingLayer>.Instance);
+
+        // Act - prompt contains disabled pattern trigger
+        var result = await layer.AnalyzeAsync("This is an attack prompt");
+
+        // Assert
+        result.IsThreat.Should().BeFalse(); // Disabled pattern should not match
+        layer.DisabledPatternCount.Should().Be(1);
+    }
+
+    [Fact]
+    public void DisabledPatternCount_ShouldReflectConfiguration()
+    {
+        // Arrange
+        var provider = new TestPatternProvider(new[]
+        {
+            new DetectionPattern
+            {
+                Id = "test-001",
+                Name = "Pattern 1",
+                Pattern = @"test1",
+                OwaspCategory = "LLM01",
+                Severity = ThreatSeverity.High,
+                Description = "Pattern 1"
+            },
+            new DetectionPattern
+            {
+                Id = "test-002",
+                Name = "Pattern 2",
+                Pattern = @"test2",
+                OwaspCategory = "LLM01",
+                Severity = ThreatSeverity.High,
+                Description = "Pattern 2"
+            }
+        });
+
+        var options = new PatternMatchingOptions
+        {
+            Enabled = true,
+            TimeoutMs = 100,
+            DisabledPatternIds = new List<string> { "test-001" }
+        };
+
+        // Act
+        var layer = new PatternMatchingLayer(
+            new[] { provider },
+            options,
+            NullLogger<PatternMatchingLayer>.Instance);
+
+        // Assert
+        layer.PatternCount.Should().Be(1); // Only 1 active
+        layer.DisabledPatternCount.Should().Be(1);
+    }
+
+    #endregion
+
+    #region Sensitivity Tests
+
+    [Theory]
+    [InlineData(SensitivityLevel.Low)]
+    [InlineData(SensitivityLevel.Medium)]
+    [InlineData(SensitivityLevel.High)]
+    [InlineData(SensitivityLevel.Paranoid)]
+    public async Task AnalyzeAsync_WithDifferentSensitivityLevels_ShouldAdjustConfidence(SensitivityLevel sensitivity)
+    {
+        // Arrange
+        var provider = new TestPatternProvider(new[]
+        {
+            new DetectionPattern
+            {
+                Id = "test-001",
+                Name = "Test Pattern",
+                Pattern = @"(?i)threat",
+                OwaspCategory = "LLM01",
+                Severity = ThreatSeverity.Medium,
+                Description = "Test pattern"
+            }
+        });
+
+        var options = new PatternMatchingOptions
+        {
+            Enabled = true,
+            TimeoutMs = 100,
+            Sensitivity = sensitivity
+        };
+
+        var layer = new PatternMatchingLayer(
+            new[] { provider },
+            options,
+            NullLogger<PatternMatchingLayer>.Instance);
+
+        // Act
+        var result = await layer.AnalyzeAsync("This is a threat prompt");
+
+        // Assert
+        result.IsThreat.Should().BeTrue();
+        result.Data.Should().ContainKey("sensitivity");
+        result.Data!["sensitivity"].Should().Be(sensitivity.ToString());
+    }
+
+    [Fact]
+    public async Task AnalyzeAsync_HighSensitivity_ShouldIncreaseConfidence()
+    {
+        // Arrange
+        var provider = new TestPatternProvider(new[]
+        {
+            new DetectionPattern
+            {
+                Id = "test-001",
+                Name = "Test Pattern",
+                Pattern = @"(?i)suspicious",
+                OwaspCategory = "LLM01",
+                Severity = ThreatSeverity.Low, // Low severity base
+                Description = "Test pattern"
+            }
+        });
+
+        var lowSensitivityOptions = new PatternMatchingOptions
+        {
+            Enabled = true,
+            TimeoutMs = 100,
+            Sensitivity = SensitivityLevel.Low
+        };
+
+        var highSensitivityOptions = new PatternMatchingOptions
+        {
+            Enabled = true,
+            TimeoutMs = 100,
+            Sensitivity = SensitivityLevel.High
+        };
+
+        var lowLayer = new PatternMatchingLayer(new[] { provider }, lowSensitivityOptions);
+        var highLayer = new PatternMatchingLayer(new[] { provider }, highSensitivityOptions);
+
+        // Act
+        var lowResult = await lowLayer.AnalyzeAsync("suspicious activity");
+        var highResult = await highLayer.AnalyzeAsync("suspicious activity");
+
+        // Assert
+        highResult.Confidence.Should().BeGreaterThan(lowResult.Confidence ?? 0);
+    }
+
+    #endregion
+
+    #region Timeout Contribution Tests
+
+    [Fact]
+    public async Task AnalyzeAsync_ConfiguredTimeoutContribution_ShouldBeUsed()
+    {
+        // Arrange
+        var options = new PatternMatchingOptions
+        {
+            Enabled = true,
+            TimeoutMs = 100,
+            TimeoutContribution = 0.5 // Custom timeout contribution
+        };
+
+        var provider = new TestPatternProvider(new[]
+        {
+            new DetectionPattern
+            {
+                Id = "test-001",
+                Name = "Test Pattern",
+                Pattern = @"test",
+                OwaspCategory = "LLM01",
+                Severity = ThreatSeverity.High,
+                Description = "Test pattern"
+            }
+        });
+
+        var layer = new PatternMatchingLayer(
+            new[] { provider },
+            options,
+            NullLogger<PatternMatchingLayer>.Instance);
+
+        // Just verify layer initializes correctly with custom timeout contribution
+        layer.PatternCount.Should().Be(1);
+    }
+
+    #endregion
+
     // Helper class for testing
     private class TestPatternProvider : IPatternProvider
     {

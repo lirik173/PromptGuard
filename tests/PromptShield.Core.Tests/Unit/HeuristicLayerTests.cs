@@ -30,7 +30,7 @@ public class HeuristicLayerTests
     private HeuristicLayer CreateLayer(IEnumerable<IHeuristicAnalyzer>? analyzers = null)
     {
         return new HeuristicLayer(
-            analyzers ?? new[] { new BuiltInHeuristicAnalyzer() },
+            analyzers ?? new[] { new BuiltInHeuristicAnalyzer(_defaultHeuristicOptions) },
             _defaultHeuristicOptions,
             _defaultGlobalOptions,
             NullLogger<HeuristicLayer>.Instance);
@@ -78,7 +78,7 @@ public class HeuristicLayerTests
         // Arrange
         var options = new HeuristicOptions { Enabled = false };
         var layer = new HeuristicLayer(
-            new[] { new BuiltInHeuristicAnalyzer() },
+            new[] { new BuiltInHeuristicAnalyzer(options) },
             options,
             _defaultGlobalOptions,
             NullLogger<HeuristicLayer>.Instance);

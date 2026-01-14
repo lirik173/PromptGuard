@@ -164,7 +164,10 @@ public static class ServiceCollectionExtensions
                 ServiceDescriptor.Singleton<IPatternProvider, BuiltInPatternProvider>());
         }
 
-        // Register built-in heuristic analyzer
+        // Register heuristic options as singleton for DI
+        services.TryAddSingleton(options.Heuristics);
+
+        // Register built-in heuristic analyzer with options
         if (options.Heuristics.Enabled)
         {
             services.TryAddEnumerable(

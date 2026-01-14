@@ -40,4 +40,7 @@ public static class BuiltInHeuristicSignals
 
     /// <summary>Bidirectional text override characters detected.</summary>
     public const string BidirectionalOverride = "bidirectional_override";
+
+    /// <summary>Matched a custom blocklist pattern.</summary>
+    public const string CustomBlocklist = "custom_blocklist";
 }

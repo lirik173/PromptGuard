@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.ML.OnnxRuntime;
@@ -30,7 +31,56 @@ public sealed class MLClassificationLayer : IDisposable
     private readonly SimpleTokenizer _tokenizer;
     private readonly FeatureExtractor _featureExtractor;
     private readonly SemaphoreSlim _inferenceSemaphore;
+    private readonly List<Regex> _allowlistRegex;
+    private readonly Dictionary<int, double> _featureWeightOverrides;
+    private readonly HashSet<int> _disabledFeatureIndices;
     private bool _disposed;
+
+    /// <summary>
+    /// Default feature weights indexed by feature index.
+    /// </summary>
+    private static readonly Dictionary<int, (string Name, double Weight)> DefaultFeatureWeights = new()
+    {
+        // Statistical features (low weight - general indicators)
+        [3] = ("Entropy", 0.05),
+        [11] = ("CompressionRatio", 0.08),
+
+        // Character distribution (medium weight)
+        [17] = ("ControlCharRatio", 0.15),
+        [18] = ("HighUnicodeRatio", 0.20),
+        [19] = ("ZeroWidthChars", 0.25),
+        [20] = ("BidiOverrides", 0.30),
+
+        // Lexical features (high weight - direct indicators)
+        [24] = ("InjectionKeywords", 0.40),
+        [25] = ("CommandKeywords", 0.25),
+        [26] = ("RoleKeywords", 0.35),
+        [30] = ("IgnorePattern", 0.50),
+        [31] = ("NewInstructionsPattern", 0.45),
+        [32] = ("PersonaSwitchPattern", 0.55),
+        [33] = ("SystemPromptRef", 0.40),
+        [34] = ("CodeIndicators", 0.20),
+
+        // Structural features (medium weight)
+        [36] = ("RepeatedDelimiters", 0.15),
+        [37] = ("XmlTags", 0.10),
+        [40] = ("Base64Content", 0.15),
+        [45] = ("TemplatePlaceholders", 0.20),
+        [47] = ("StructuralComplexity", 0.10)
+    };
+
+    /// <summary>
+    /// Mapping from feature name to index.
+    /// </summary>
+    private static readonly Dictionary<string, int> FeatureNameToIndex;
+
+    static MLClassificationLayer()
+    {
+        FeatureNameToIndex = DefaultFeatureWeights.ToDictionary(
+            kvp => kvp.Value.Name,
+            kvp => kvp.Key,
+            StringComparer.OrdinalIgnoreCase);
+    }
 
     /// <summary>
     /// Classification result with additional metadata.
@@ -87,6 +137,15 @@ public sealed class MLClassificationLayer : IDisposable
             _options.MaxConcurrentInferences,
             _options.MaxConcurrentInferences);
 
+        // Compile allowlist patterns
+        _allowlistRegex = CompileAllowlistPatterns(options.AllowedPatterns);
+
+        // Build feature weight overrides from configuration
+        _featureWeightOverrides = BuildFeatureWeightOverrides(options.FeatureWeights);
+
+        // Build disabled feature indices
+        _disabledFeatureIndices = BuildDisabledFeatureIndices(options.DisabledFeatures);
+
         LogInitializationStatus();
     }
 
@@ -108,6 +167,13 @@ public sealed class MLClassificationLayer : IDisposable
         if (!_options.Enabled)
         {
             return CreateDisabledResult();
+        }
+
+        // Check allowlist first
+        if (IsAllowlisted(prompt))
+        {
+            _logger.LogDebug("Prompt matched ML allowlist pattern, skipping classification");
+            return CreateAllowlistedResult();
         }
 
         var stopwatch = Stopwatch.StartNew();
@@ -154,6 +220,96 @@ public sealed class MLClassificationLayer : IDisposable
             return CreateErrorResult(ex.Message, stopwatch.Elapsed);
         }
     }
+
+    #region Allowlist
+
+    private List<Regex> CompileAllowlistPatterns(List<string> patterns)
+    {
+        var compiled = new List<Regex>();
+        foreach (var pattern in patterns)
+        {
+            try
+            {
+                compiled.Add(new Regex(pattern, RegexOptions.IgnoreCase | RegexOptions.Compiled,
+                    TimeSpan.FromMilliseconds(50)));
+            }
+            catch (ArgumentException ex)
+            {
+                _logger.LogWarning(ex, "Invalid regex pattern in ML allowlist: {Pattern}", pattern);
+            }
+        }
+        return compiled;
+    }
+
+    private bool IsAllowlisted(string prompt)
+    {
+        foreach (var regex in _allowlistRegex)
+        {
+            try
+            {
+                if (regex.IsMatch(prompt))
+                {
+                    return true;
+                }
+            }
+            catch (RegexMatchTimeoutException)
+            {
+                // Timeout on allowlist - don't allow
+            }
+        }
+        return false;
+    }
+
+    #endregion
+
+    #region Feature Weight Configuration
+
+    private Dictionary<int, double> BuildFeatureWeightOverrides(Dictionary<string, double>? customWeights)
+    {
+        var overrides = new Dictionary<int, double>();
+
+        if (customWeights == null || customWeights.Count == 0)
+        {
+            return overrides;
+        }
+
+        foreach (var (name, weight) in customWeights)
+        {
+            if (FeatureNameToIndex.TryGetValue(name, out var index))
+            {
+                overrides[index] = Math.Clamp(weight, 0.0, 1.0);
+                _logger.LogDebug("Feature weight override: {Feature} = {Weight}", name, weight);
+            }
+            else
+            {
+                _logger.LogWarning("Unknown feature name in weight configuration: {Feature}", name);
+            }
+        }
+
+        return overrides;
+    }
+
+    private HashSet<int> BuildDisabledFeatureIndices(List<string> disabledFeatures)
+    {
+        var indices = new HashSet<int>();
+
+        foreach (var name in disabledFeatures)
+        {
+            if (FeatureNameToIndex.TryGetValue(name, out var index))
+            {
+                indices.Add(index);
+                _logger.LogDebug("Feature disabled: {Feature}", name);
+            }
+            else
+            {
+                _logger.LogWarning("Unknown feature name in disabled list: {Feature}", name);
+            }
+        }
+
+        return indices;
+    }
+
+    #endregion
 
     /// <summary>
     /// Performs the ML classification using available inference modes.
@@ -289,56 +445,77 @@ public sealed class MLClassificationLayer : IDisposable
     }
 
     /// <summary>
-    /// Calculates a threat score from extracted features using weighted heuristics.
+    /// Calculates a threat score from extracted features using configurable weighted heuristics.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static double CalculateFeatureScore(float[] features)
+    private double CalculateFeatureScore(float[] features)
     {
-        // Feature weights learned from analysis (indices correspond to FeatureExtractor output)
-        // These weights emphasize security-relevant features
-
         var score = 0.0;
+        var minContribution = _options.MinFeatureContribution;
+        var sensitivityMultiplier = GetSensitivityMultiplier();
 
-        // Statistical features (low weight - general indicators)
-        score += features[3] * 0.05;  // Entropy
-        score += features[11] * 0.08; // Compression ratio (repetitiveness)
+        foreach (var (index, (name, defaultWeight)) in DefaultFeatureWeights)
+        {
+            // Skip disabled features
+            if (_disabledFeatureIndices.Contains(index))
+            {
+                continue;
+            }
 
-        // Character distribution (medium weight)
-        score += features[17] * 0.15; // Control characters
-        score += features[18] * 0.20; // High Unicode
-        score += features[19] * 0.25; // Zero-width characters
-        score += features[20] * 0.30; // Bidirectional overrides
+            // Get feature value
+            if (index >= features.Length)
+            {
+                continue;
+            }
 
-        // Lexical features (high weight - direct indicators)
-        score += features[24] * 0.40; // Injection keyword density
-        score += features[25] * 0.25; // Command keyword density
-        score += features[26] * 0.35; // Role keyword density
-        score += features[30] * 0.50; // "Ignore" pattern
-        score += features[31] * 0.45; // "New instructions" pattern
-        score += features[32] * 0.55; // Persona switch pattern
-        score += features[33] * 0.40; // System prompt reference
-        score += features[34] * 0.20; // Code indicators
+            var featureValue = features[index];
 
-        // Structural features (medium weight)
-        score += features[36] * 0.15; // Repeated delimiters
-        score += features[37] * 0.10; // XML tags
-        score += features[40] * 0.15; // Base64 encoding
-        score += features[45] * 0.20; // Template placeholders
-        score += features[47] * 0.10; // Structural complexity
+            // Skip features below minimum contribution threshold
+            if (featureValue < minContribution)
+            {
+                continue;
+            }
+
+            // Get weight (override or default)
+            var weight = _featureWeightOverrides.TryGetValue(index, out var overrideWeight)
+                ? overrideWeight
+                : defaultWeight;
+
+            // Apply sensitivity adjustment
+            var adjustedWeight = weight * sensitivityMultiplier;
+
+            score += featureValue * adjustedWeight;
+        }
 
         // Normalize to 0-1 range using sigmoid
         return Sigmoid(score * 2 - 2);
     }
 
     /// <summary>
+    /// Gets the sensitivity multiplier based on configured sensitivity level.
+    /// </summary>
+    private double GetSensitivityMultiplier()
+    {
+        return _options.Sensitivity switch
+        {
+            SensitivityLevel.Low => 0.7,
+            SensitivityLevel.Medium => 1.0,
+            SensitivityLevel.High => 1.3,
+            SensitivityLevel.Paranoid => 1.6,
+            _ => 1.0
+        };
+    }
+
+    /// <summary>
     /// Combines model prediction with feature-based score using weighted ensemble.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static double CombineScores(double modelScore, double featureScore)
+    private double CombineScores(double modelScore, double featureScore)
     {
-        // Weighted combination: model gets more weight when confident
+        // Use configured model weight
+        var baseModelWeight = _options.ModelWeight;
+
+        // Adjust based on model confidence (more weight when confident)
         var modelConfidence = Math.Abs(modelScore - 0.5) * 2; // 0 at 0.5, 1 at extremes
-        var modelWeight = 0.6 + (modelConfidence * 0.2);
+        var modelWeight = baseModelWeight + (modelConfidence * (1.0 - baseModelWeight) * 0.3);
         var featureWeight = 1.0 - modelWeight;
 
         var combined = (modelScore * modelWeight) + (featureScore * featureWeight);
@@ -348,7 +525,7 @@ public sealed class MLClassificationLayer : IDisposable
     /// <summary>
     /// Identifies top contributing features for explainability.
     /// </summary>
-    private static string[] IdentifyTopContributingFeatures(float[] features)
+    private string[] IdentifyTopContributingFeatures(float[] features)
     {
         var featureNames = new[]
         {
@@ -367,8 +544,8 @@ public sealed class MLClassificationLayer : IDisposable
         };
 
         return features
-            .Select((value, index) => (Name: index < featureNames.Length ? featureNames[index] : $"Feature{index}", Value: value))
-            .Where(f => f.Value > 0.3)
+            .Select((value, index) => (Name: index < featureNames.Length ? featureNames[index] : $"Feature{index}", Value: value, Index: index))
+            .Where(f => f.Value > 0.3 && !_disabledFeatureIndices.Contains(f.Index))
             .OrderByDescending(f => f.Value)
             .Take(5)
             .Select(f => $"{f.Name}:{f.Value:F2}")
@@ -400,6 +577,19 @@ public sealed class MLClassificationLayer : IDisposable
     {
         LayerName = LayerName,
         WasExecuted = false
+    };
+
+    private LayerResult CreateAllowlistedResult() => new()
+    {
+        LayerName = LayerName,
+        WasExecuted = true,
+        Confidence = 0.0,
+        IsThreat = false,
+        Data = new Dictionary<string, object>
+        {
+            ["status"] = "allowlisted",
+            ["reason"] = "Prompt matched allowlist pattern"
+        }
     };
 
     private LayerResult CreateConcurrencyLimitResult(TimeSpan duration) => new()
@@ -436,10 +626,11 @@ public sealed class MLClassificationLayer : IDisposable
         var isThreat = result.ThreatProbability >= _options.Threshold;
 
         _logger.LogDebug(
-            "ML classification completed: IsThreat={IsThreat}, Confidence={Confidence:F3}, Mode={Mode}, Duration={Duration}ms",
+            "ML classification completed: IsThreat={IsThreat}, Confidence={Confidence:F3}, Mode={Mode}, Sensitivity={Sensitivity}, Duration={Duration}ms",
             isThreat,
             result.ThreatProbability,
             result.Mode,
+            _options.Sensitivity,
             duration.TotalMilliseconds);
 
         var data = new Dictionary<string, object>
@@ -447,6 +638,7 @@ public sealed class MLClassificationLayer : IDisposable
             ["status"] = "success",
             ["threshold"] = _options.Threshold,
             ["mode"] = result.Mode.ToString(),
+            ["sensitivity"] = _options.Sensitivity.ToString(),
             ["threat_probability"] = result.ThreatProbability,
             ["benign_probability"] = result.BenignProbability,
             ["model_available"] = _modelLoader.IsAvailable
@@ -455,6 +647,11 @@ public sealed class MLClassificationLayer : IDisposable
         if (result.TopContributingFeatures.Length > 0)
         {
             data["top_features"] = result.TopContributingFeatures;
+        }
+
+        if (_disabledFeatureIndices.Count > 0)
+        {
+            data["disabled_features_count"] = _disabledFeatureIndices.Count;
         }
 
         return new LayerResult
@@ -482,11 +679,15 @@ public sealed class MLClassificationLayer : IDisposable
         {
             _logger.LogInformation(
                 "MLClassificationLayer initialized. ModelAvailable={ModelAvailable}, " +
-                "MaxSequenceLength={MaxSequenceLength}, Threshold={Threshold}, FeatureCount={FeatureCount}",
+                "MaxSequenceLength={MaxSequenceLength}, Threshold={Threshold}, Sensitivity={Sensitivity}, " +
+                "FeatureCount={FeatureCount}, DisabledFeatures={DisabledCount}, AllowlistPatterns={AllowlistCount}",
                 _modelLoader.IsAvailable,
                 _options.MaxSequenceLength,
                 _options.Threshold,
-                FeatureExtractor.FeatureCount);
+                _options.Sensitivity,
+                FeatureExtractor.FeatureCount,
+                _disabledFeatureIndices.Count,
+                _allowlistRegex.Count);
         }
     }
 

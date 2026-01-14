@@ -1,4 +1,4 @@
-﻿namespace PromptShield.Abstractions.Configuration;
+namespace PromptShield.Abstractions.Configuration;
 
 /// <summary>
 /// ML classification layer options.
@@ -62,4 +62,49 @@ public sealed class MLClassificationOptions
     /// Useful for debugging and explainability but adds slight overhead.
     /// </summary>
     public bool IncludeFeatureImportance { get; set; } = true;
+
+    /// <summary>
+    /// Sensitivity level that adjusts feature scoring.
+    /// Higher sensitivity catches more threats but may produce more false positives.
+    /// </summary>
+    public SensitivityLevel Sensitivity { get; set; } = SensitivityLevel.Medium;
+
+    /// <summary>
+    /// Custom feature weights for fine-tuning detection.
+    /// Keys are feature names (e.g., "InjectionKeywords", "IgnorePattern").
+    /// Values are weights (0.0 to 1.0). If null or empty, default weights are used.
+    /// </summary>
+    /// <remarks>
+    /// Available feature names:
+    /// - Statistical: Entropy, CompressionRatio
+    /// - Character: ControlCharRatio, HighUnicodeRatio, ZeroWidthChars, BidiOverrides
+    /// - Lexical: InjectionKeywords, CommandKeywords, RoleKeywords, IgnorePattern,
+    ///   NewInstructionsPattern, PersonaSwitchPattern, SystemPromptRef, CodeIndicators
+    /// - Structural: RepeatedDelimiters, XmlTags, Base64Content, TemplatePlaceholders, StructuralComplexity
+    /// </remarks>
+    public Dictionary<string, double>? FeatureWeights { get; set; }
+
+    /// <summary>
+    /// Regex patterns that should bypass ML classification (allowlist).
+    /// If a prompt matches any of these patterns, ML analysis returns safe.
+    /// Use for known-safe patterns specific to your domain.
+    /// </summary>
+    public List<string> AllowedPatterns { get; set; } = new();
+
+    /// <summary>
+    /// Feature names to exclude from scoring.
+    /// Use to disable specific features that cause false positives in your domain.
+    /// </summary>
+    /// <example>
+    /// To disable "IgnorePattern" feature which may cause false positives:
+    /// DisabledFeatures = new List&lt;string&gt; { "IgnorePattern" }
+    /// </example>
+    public List<string> DisabledFeatures { get; set; } = new();
+
+    /// <summary>
+    /// Minimum feature contribution threshold.
+    /// Features with values below this threshold are ignored in scoring.
+    /// Higher values reduce noise but may miss subtle attacks.
+    /// </summary>
+    public double MinFeatureContribution { get; set; } = 0.1;
 }
