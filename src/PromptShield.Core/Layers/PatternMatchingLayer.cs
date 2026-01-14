@@ -38,17 +38,17 @@ public sealed class PatternMatchingLayer
 
     public string LayerName => "PatternMatching";
 
-    public async Task<LayerResult> AnalyzeAsync(
+    public Task<LayerResult> AnalyzeAsync(
         string prompt,
         CancellationToken cancellationToken = default)
     {
         if (!_options.Enabled)
         {
-            return new LayerResult
+            return Task.FromResult(new LayerResult
             {
                 LayerName = LayerName,
                 WasExecuted = false
-            };
+            });
         }
 
         var stopwatch = Stopwatch.StartNew();
@@ -150,7 +150,7 @@ public sealed class PatternMatchingLayer
             data["severity"] = highestSeverity.ToString();
         }
 
-        return new LayerResult
+        return Task.FromResult(new LayerResult
         {
             LayerName = LayerName,
             WasExecuted = true,
@@ -158,7 +158,7 @@ public sealed class PatternMatchingLayer
             IsThreat = isThreat,
             Duration = stopwatch.Elapsed,
             Data = data
-        };
+        });
     }
 
     private void CompilePatterns(IEnumerable<IPatternProvider> providers)

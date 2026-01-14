@@ -6,7 +6,7 @@ internal class Program
 {
     private static void Main(string[] args)
     {
-        // Placeholder - benchmarks will be added later
-        Console.WriteLine("PromptShield Benchmarks - benchmarks will be implemented in Phase 6");
+        // Run all benchmarks
+        BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);
     }
 }

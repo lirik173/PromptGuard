@@ -81,16 +81,46 @@ The detection pipeline demonstrates a cascading architecture with early exit opt
 
 | Layer | Description | Typical Latency |
 |-------|-------------|-----------------|
+| **Language Filter** | Gate: blocks unsupported languages | < 1ms |
 | **Pattern Matching** | Regex-based known attack detection | < 0.5ms |
 | **Heuristic Analysis** | Behavioral signals and anomalies | < 0.5ms |
 | **ML Classification** | ONNX-based neural classifier | < 5ms |
-| **Semantic Analysis** | LLM-powered deep analysis (opt-in) | < 50ms |
 
 ```
-Input → Validation → Pattern Layer → Heuristic Layer → [ML Layer] → Result
-                          ↓              ↓
-                    Early Exit      Early Exit
-                   (≥0.9 conf)    (≥0.85/≤0.15)
+Input → Language Filter → Pattern Layer → Heuristic Layer → [ML Layer] → Result
+              │                 │               │
+         Unsupported?      Early Exit      Early Exit
+              │            (≥0.9 conf)    (≥0.85/≤0.15)
+              ▼
+           BLOCK
+```
+
+### Language Support
+
+> ⚠️ **Important**: All detection layers require language-specific patterns and vocabulary. By default, only **English** is supported.
+
+The Language Filter acts as a **gate**:
+- **Supported language** → proceed to detection layers
+- **Unsupported language** → block (configurable)
+
+```csharp
+services.AddPromptShield(options =>
+{
+    options.Language.Enabled = true;
+    options.Language.SupportedLanguages = ["en"];  // Only English by default
+    options.Language.OnUnsupportedLanguage = UnsupportedLanguageBehavior.Block;
+});
+```
+
+**To add support for other languages:**
+1. Add the language code to `SupportedLanguages`
+2. Implement `IPatternProvider` with patterns for that language
+3. Optionally implement `IHeuristicAnalyzer` for language-specific heuristics
+
+```csharp
+// Example: Adding Ukrainian support
+options.Language.SupportedLanguages = ["en", "uk"];
+services.AddPatternProvider<UkrainianPatternProvider>();
 ```
 
 ---
@@ -126,16 +156,28 @@ Each detection layer has complementary strengths:
 options.OnAnalysisError = FailureBehavior.FailClosed;
 ```
 
-### 3. Extensibility Points
+### 3. Language Filter (Gate)
+
+```csharp
+services.AddPromptShield(options =>
+{
+    options.Language.Enabled = true;
+    options.Language.SupportedLanguages = ["en"];  // Block non-English
+    options.Language.OnUnsupportedLanguage = UnsupportedLanguageBehavior.Block;
+});
+```
+
+### 4. Extensibility Points
 
 ```csharp
 services.AddPromptShield()
-    .AddPatternProvider<CustomPatternProvider>()
-    .AddHeuristicAnalyzer<CustomHeuristicAnalyzer>()
+    .AddPatternProvider<GermanPatternProvider>()      // Add patterns for German
+    .AddHeuristicAnalyzer<GermanHeuristicAnalyzer>()  // Add German heuristics
+    .AddLanguageDetector<AzureLanguageDetector>()     // Use Azure for detection
     .AddEventHandler<SecurityAuditHandler>();
 ```
 
-### 4. Observable Architecture
+### 5. Observable Architecture
 
 ```csharp
 builder.Services.AddOpenTelemetry()
@@ -177,6 +219,14 @@ dotnet run -c Release
 ## Limitations & Known Issues
 
 As a POC, this project has the following limitations:
+
+### Language Support
+
+- ⚠️ **English-only rule-based detection** — Pattern matching, heuristics, and ML vocabulary are designed for English
+- ✅ **Language Filter mitigation** — Non-English prompts can be routed to Semantic Analysis (LLM-based)
+- 🔧 **Extensibility** — Implement `IPatternProvider` to add patterns for other languages
+
+### Other Limitations
 
 - ❌ **No pre-trained ML model** — ML layer requires external ONNX model
 - ❌ **Limited pattern library** — Built-in patterns are illustrative only

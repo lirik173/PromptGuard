@@ -1,11 +1,14 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
+using PromptShield.Abstractions.Analysis;
 using PromptShield.Abstractions.Analyzers;
 using PromptShield.Abstractions.Analyzers.Heuristics;
 using PromptShield.Abstractions.Configuration;
 using PromptShield.Abstractions.Detection.Patterns;
 using PromptShield.Abstractions.Events;
+using PromptShield.Core.Language;
 using PromptShield.Core.Layers;
 using PromptShield.Core.Patterns;
 using PromptShield.Core.Pipeline;
@@ -53,6 +56,40 @@ public static class ServiceCollectionExtensions
     }
 
     /// <summary>
+    /// Adds PromptShield services to the service collection with IConfiguration binding.
+    /// </summary>
+    /// <param name="services">The service collection.</param>
+    /// <param name="configuration">Configuration instance to bind from.</param>
+    /// <param name="configure">Optional action to further configure options after binding.</param>
+    /// <returns>The service collection for chaining.</returns>
+    /// <remarks>
+    /// This method binds configuration from the "PromptShield" section in appsettings.json
+    /// and allows additional programmatic configuration via the configure action.
+    /// </remarks>
+    public static IServiceCollection AddPromptShield(
+        this IServiceCollection services,
+        IConfiguration configuration,
+        Action<PromptShieldOptions>? configure = null)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        // Bind from configuration
+        var options = new PromptShieldOptions();
+        configuration.GetSection(PromptShieldOptions.SectionName).Bind(options);
+
+        // Apply additional configuration if provided
+        configure?.Invoke(options);
+
+        services.AddSingleton(options);
+
+        // Register core components
+        RegisterCoreServices(services, options);
+
+        return services;
+    }
+
+    /// <summary>
     /// Adds a custom pattern provider to the service collection.
     /// </summary>
     /// <typeparam name="TProvider">The pattern provider type.</typeparam>
@@ -91,8 +128,35 @@ public static class ServiceCollectionExtensions
         return services;
     }
 
-    private static void RegisterCoreServices(IServiceCollection services, PromptShieldOptions options)
+    /// <summary>
+    /// Adds a custom language detector to the service collection.
+    /// </summary>
+    /// <typeparam name="TDetector">The language detector type.</typeparam>
+    /// <param name="services">The service collection.</param>
+    /// <returns>The service collection for chaining.</returns>
+    public static IServiceCollection AddLanguageDetector<TDetector>(this IServiceCollection services)
+        where TDetector : class, ILanguageDetector
     {
+        services.AddSingleton<ILanguageDetector, TDetector>();
+        return services;
+    }
+
+    internal static void RegisterCoreServices(IServiceCollection services, PromptShieldOptions options)
+    {
+        // Register Language Detector (default implementation)
+        services.TryAddSingleton<ILanguageDetector, SimpleLanguageDetector>();
+
+        // Register Language Filter layer (if enabled)
+        if (options.Language.Enabled)
+        {
+            services.TryAddSingleton<LanguageFilterLayer>(sp =>
+            {
+                var languageDetector = sp.GetRequiredService<ILanguageDetector>();
+                var logger = sp.GetService<ILogger<LanguageFilterLayer>>();
+                return new LanguageFilterLayer(options.Language, languageDetector, logger);
+            });
+        }
+
         // Register built-in pattern provider
         if (options.PatternMatching.IncludeBuiltInPatterns)
         {
@@ -127,13 +191,49 @@ public static class ServiceCollectionExtensions
             return new HeuristicLayer(analyzers, options.Heuristics, options, logger);
         });
 
+        // Register ML Classification layer (if enabled)
+        if (options.ML.Enabled)
+        {
+            services.TryAddSingleton<MLClassificationLayer>(sp =>
+            {
+                var logger = sp.GetService<ILogger<MLClassificationLayer>>();
+                return new MLClassificationLayer(options.ML, options, logger);
+            });
+        }
+
+        // Register Semantic Analysis layer (if enabled)
+        if (options.SemanticAnalysis.Enabled)
+        {
+            services.TryAddSingleton<SemanticAnalysisLayer>(sp =>
+            {
+                var httpClientFactory = sp.GetService<IHttpClientFactory>();
+                var logger = sp.GetService<ILogger<SemanticAnalysisLayer>>();
+                return new SemanticAnalysisLayer(
+                    options.SemanticAnalysis,
+                    options,
+                    httpClientFactory,
+                    logger);
+            });
+        }
+
         // Register pipeline orchestrator
         services.TryAddSingleton<PipelineOrchestrator>(sp =>
         {
+            var languageFilterLayer = sp.GetService<LanguageFilterLayer>();
             var patternLayer = sp.GetRequiredService<PatternMatchingLayer>();
             var heuristicLayer = sp.GetRequiredService<HeuristicLayer>();
+            var mlLayer = sp.GetService<MLClassificationLayer>();
+            var semanticLayer = sp.GetService<SemanticAnalysisLayer>();
             var logger = sp.GetService<ILogger<PipelineOrchestrator>>();
-            return new PipelineOrchestrator(patternLayer, heuristicLayer, options, logger);
+
+            return new PipelineOrchestrator(
+                languageFilterLayer,
+                patternLayer,
+                heuristicLayer,
+                mlLayer,
+                semanticLayer,
+                options,
+                logger);
         });
 
         // Register main analyzer
