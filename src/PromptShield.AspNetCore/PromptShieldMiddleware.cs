@@ -47,14 +47,12 @@ public sealed class PromptShieldMiddleware
     {
         ArgumentNullException.ThrowIfNull(context);
 
-        // Check if this request should be analyzed
         if (!ShouldAnalyze(context.Request))
         {
             await _next(context);
             return;
         }
 
-        // Extract prompt from request
         string? prompt;
         try
         {
@@ -69,12 +67,10 @@ public sealed class PromptShieldMiddleware
 
         if (string.IsNullOrWhiteSpace(prompt))
         {
-            // No prompt found, pass through
             await _next(context);
             return;
         }
 
-        // Analyze the prompt
         AnalysisResult result;
         try
         {
@@ -108,7 +104,6 @@ public sealed class PromptShieldMiddleware
             return;
         }
 
-        // Add analysis ID to response headers
         context.Response.Headers[_options.AnalysisIdHeader] = result.AnalysisId.ToString();
 
         if (result.IsThreat)
@@ -135,49 +130,40 @@ public sealed class PromptShieldMiddleware
 
     private bool ShouldAnalyze(HttpRequest request)
     {
-        // Check HTTP method
-        if (!_options.HttpMethods.Contains(request.Method, StringComparer.OrdinalIgnoreCase))
-        {
+        if (!IsMethodAllowed(request.Method))
             return false;
-        }
 
-        // Check content type
-        var contentType = request.ContentType?.Split(';').FirstOrDefault()?.Trim();
-        if (string.IsNullOrEmpty(contentType) ||
-            !_options.ContentTypesToAnalyze.Contains(contentType, StringComparer.OrdinalIgnoreCase))
-        {
+        if (!IsContentTypeAllowed(request.ContentType))
             return false;
-        }
 
-        var path = request.Path.Value ?? string.Empty;
+        return IsPathAllowed(request.Path.Value ?? string.Empty);
+    }
 
-        // Check excluded paths first (takes precedence)
+    private bool IsMethodAllowed(string method)
+        => _options.HttpMethods.Contains(method, StringComparer.OrdinalIgnoreCase);
+
+    private bool IsContentTypeAllowed(string? contentType)
+    {
+        var mimeType = contentType?.Split(';').FirstOrDefault()?.Trim();
+        return !string.IsNullOrEmpty(mimeType) &&
+               _options.ContentTypesToAnalyze.Contains(mimeType, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private bool IsPathAllowed(string path)
+    {
         if (_options.ExcludedPaths.Any(excluded => MatchPath(path, excluded)))
-        {
             return false;
-        }
 
-        // If protected paths are specified, check if current path matches
-        if (_options.ProtectedPaths.Count > 0)
-        {
-            return _options.ProtectedPaths.Any(protectedPath => MatchPath(path, protectedPath));
-        }
-
-        // No protected paths specified = protect all (except excluded)
-        return true;
+        return _options.ProtectedPaths.Count == 0 ||
+               _options.ProtectedPaths.Any(protectedPath => MatchPath(path, protectedPath));
     }
 
     private static bool MatchPath(string path, string pattern)
     {
-        if (pattern.EndsWith("/*", StringComparison.Ordinal))
+        // Handle wildcard suffixes: "/api/*" or "/api*"
+        if (pattern.EndsWith('*'))
         {
-            var prefix = pattern[..^2];
-            return path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
-        }
-
-        if (pattern.EndsWith("*", StringComparison.Ordinal))
-        {
-            var prefix = pattern[..^1];
+            var prefix = pattern.TrimEnd('*').TrimEnd('/');
             return path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
         }
 
@@ -186,7 +172,6 @@ public sealed class PromptShieldMiddleware
 
     private async Task<string?> ExtractPromptAsync(HttpRequest request)
     {
-        // Enable buffering so the body can be read multiple times
         request.EnableBuffering();
 
         if (request.ContentLength > _options.MaxRequestBodySize)
@@ -206,8 +191,6 @@ public sealed class PromptShieldMiddleware
             leaveOpen: true);
 
         var body = await reader.ReadToEndAsync();
-
-        // Reset position for downstream middleware/handlers
         request.Body.Position = 0;
 
         if (string.IsNullOrWhiteSpace(body))
@@ -215,14 +198,10 @@ public sealed class PromptShieldMiddleware
             return null;
         }
 
-        // Check if it's plain text
         var contentType = request.ContentType?.Split(';').FirstOrDefault()?.Trim();
         if (contentType?.Equals("text/plain", StringComparison.OrdinalIgnoreCase) == true)
-        {
             return body;
-        }
 
-        // Try to parse as JSON and extract prompt
         return ExtractPromptFromJson(body);
     }
 
@@ -233,21 +212,15 @@ public sealed class PromptShieldMiddleware
             using var document = JsonDocument.Parse(json);
             var root = document.RootElement;
 
-            // Try primary path
             var prompt = GetJsonValue(root, _options.PromptJsonPath);
             if (!string.IsNullOrWhiteSpace(prompt))
-            {
                 return prompt;
-            }
 
-            // Try alternative paths
             foreach (var path in _options.AlternativePromptPaths)
             {
                 prompt = GetJsonValue(root, path);
                 if (!string.IsNullOrWhiteSpace(prompt))
-                {
                     return prompt;
-                }
             }
 
             return null;
@@ -261,11 +234,8 @@ public sealed class PromptShieldMiddleware
 
     private static string? GetJsonValue(JsonElement element, string path)
     {
-        // Handle array notation like "messages[*].content"
         if (path.Contains("[*]", StringComparison.Ordinal))
-        {
             return GetJsonArrayValue(element, path);
-        }
 
         var parts = path.Split('.');
         var current = element;
@@ -290,7 +260,6 @@ public sealed class PromptShieldMiddleware
 
     private static string? GetJsonArrayValue(JsonElement element, string path)
     {
-        // Parse path like "messages[*].content"
         var arrayIndex = path.IndexOf("[*]", StringComparison.Ordinal);
         if (arrayIndex < 0) return null;
 
@@ -310,11 +279,8 @@ public sealed class PromptShieldMiddleware
         }
 
         if (arrayElement.ValueKind != JsonValueKind.Array)
-        {
             return null;
-        }
 
-        // Concatenate all values from the array
         var values = new List<string>();
         foreach (var item in arrayElement.EnumerateArray())
         {
@@ -328,11 +294,32 @@ public sealed class PromptShieldMiddleware
         return values.Count > 0 ? string.Join("\n", values) : null;
     }
 
-    private async Task HandleExtractionError(HttpContext context, Exception ex)
+    private Task HandleExtractionError(HttpContext context, Exception ex)
+        => HandleErrorAsync(
+            context,
+            "extraction",
+            "https://promptshield.dev/errors/extraction-failed",
+            "Request Processing Failed",
+            "Unable to process request for security analysis.");
+
+    private Task HandleAnalysisError(HttpContext context, Exception ex)
+        => HandleErrorAsync(
+            context,
+            "analysis",
+            "https://promptshield.dev/errors/analysis-failed",
+            "Security Analysis Failed",
+            "Unable to complete security analysis. Request blocked for safety.");
+
+    private async Task HandleErrorAsync(
+        HttpContext context,
+        string errorType,
+        string problemType,
+        string title,
+        string detail)
     {
         if (_options.OnAnalysisError == FailureBehavior.FailOpen)
         {
-            _logger.LogWarning("Allowing request due to extraction error (fail-open)");
+            _logger.LogWarning("Allowing request due to {ErrorType} error (fail-open)", errorType);
             await _next(context);
             return;
         }
@@ -340,38 +327,13 @@ public sealed class PromptShieldMiddleware
         context.Response.StatusCode = 500;
         context.Response.ContentType = "application/problem+json";
 
-        var problem = new
+        await context.Response.WriteAsJsonAsync(new
         {
-            type = "https://promptshield.dev/errors/extraction-failed",
-            title = "Request Processing Failed",
+            type = problemType,
+            title,
             status = 500,
-            detail = "Unable to process request for security analysis."
-        };
-
-        await context.Response.WriteAsJsonAsync(problem);
-    }
-
-    private async Task HandleAnalysisError(HttpContext context, Exception ex)
-    {
-        if (_options.OnAnalysisError == FailureBehavior.FailOpen)
-        {
-            _logger.LogWarning("Allowing request due to analysis error (fail-open)");
-            await _next(context);
-            return;
-        }
-
-        context.Response.StatusCode = 500;
-        context.Response.ContentType = "application/problem+json";
-
-        var problem = new
-        {
-            type = "https://promptshield.dev/errors/analysis-failed",
-            title = "Security Analysis Failed",
-            status = 500,
-            detail = "Unable to complete security analysis. Request blocked for safety."
-        };
-
-        await context.Response.WriteAsJsonAsync(problem);
+            detail
+        });
     }
 
     private async Task WriteThreatResponse(HttpContext context, AnalysisResult result)
@@ -379,33 +341,27 @@ public sealed class PromptShieldMiddleware
         context.Response.StatusCode = _options.ThreatStatusCode;
         context.Response.ContentType = "application/problem+json";
 
-        object problem;
+        var problem = BuildThreatProblem(result);
+        await context.Response.WriteAsJsonAsync(problem);
+    }
+
+    private object BuildThreatProblem(AnalysisResult result)
+    {
+        var baseProblem = new Dictionary<string, object?>
+        {
+            ["type"] = "https://promptshield.dev/errors/threat-detected",
+            ["title"] = "Request Blocked",
+            ["status"] = _options.ThreatStatusCode,
+            ["detail"] = result.ThreatInfo?.UserFacingMessage ?? "Your request was blocked due to security concerns.",
+            ["analysisId"] = result.AnalysisId
+        };
 
         if (_options.IncludeAnalysisDetailsInResponse)
         {
-            problem = new
-            {
-                type = "https://promptshield.dev/errors/threat-detected",
-                title = "Request Blocked",
-                status = _options.ThreatStatusCode,
-                detail = result.ThreatInfo?.UserFacingMessage ?? "Your request was blocked due to security concerns.",
-                analysisId = result.AnalysisId,
-                owaspCategory = result.ThreatInfo?.OwaspCategory,
-                confidence = result.Confidence
-            };
-        }
-        else
-        {
-            problem = new
-            {
-                type = "https://promptshield.dev/errors/threat-detected",
-                title = "Request Blocked",
-                status = _options.ThreatStatusCode,
-                detail = result.ThreatInfo?.UserFacingMessage ?? "Your request was blocked due to security concerns.",
-                analysisId = result.AnalysisId
-            };
+            baseProblem["owaspCategory"] = result.ThreatInfo?.OwaspCategory;
+            baseProblem["confidence"] = result.Confidence;
         }
 
-        await context.Response.WriteAsJsonAsync(problem);
+        return baseProblem;
     }
 }

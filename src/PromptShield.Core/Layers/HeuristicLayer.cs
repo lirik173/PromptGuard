@@ -48,79 +48,110 @@ public sealed class HeuristicLayer
         CancellationToken cancellationToken = default)
     {
         if (!_heuristicOptions.Enabled)
-        {
-            return new LayerResult
-            {
-                LayerName = LayerName,
-                WasExecuted = false
-            };
-        }
+            return CreateDisabledResult();
 
         var stopwatch = Stopwatch.StartNew();
-        var allSignals = new List<HeuristicSignal>();
-        var analyzerResults = new List<HeuristicResult>();
+        var context = new HeuristicContext
+        {
+            Prompt = prompt,
+            PatternMatchingResult = patternMatchingResult,
+            Options = _globalOptions
+        };
 
         try
         {
-            var context = new HeuristicContext
-            {
-                Prompt = prompt,
-                PatternMatchingResult = patternMatchingResult,
-                Options = _globalOptions
-            };
-
-            foreach (var analyzer in _analyzers)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                try
-                {
-                    var analyzerStopwatch = Stopwatch.StartNew();
-                    var result = await analyzer.AnalyzeAsync(context, cancellationToken);
-                    analyzerStopwatch.Stop();
-
-                    analyzerResults.Add(result);
-                    allSignals.AddRange(result.Signals);
-
-                    _logger.LogDebug(
-                        "Heuristic analyzer {AnalyzerName} completed: Score={Score:F3}, Signals={SignalCount}, Duration={Duration}ms",
-                        analyzer.AnalyzerName,
-                        result.Score,
-                        result.Signals.Count,
-                        analyzerStopwatch.Elapsed.TotalMilliseconds);
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(
-                        ex,
-                        "Heuristic analyzer {AnalyzerName} failed",
-                        analyzer.AnalyzerName);
-                    // Continue with other analyzers
-                }
-            }
+            var (analyzerResults, allSignals) = await RunAnalyzersAsync(context, cancellationToken);
+            stopwatch.Stop();
+            return BuildResult(analyzerResults, allSignals, stopwatch.Elapsed);
         }
         catch (OperationCanceledException)
         {
             _logger.LogWarning("Heuristic analysis cancelled");
             throw;
         }
-        finally
+    }
+
+    private async Task<(List<HeuristicResult> Results, List<HeuristicSignal> Signals)> RunAnalyzersAsync(
+        HeuristicContext context,
+        CancellationToken cancellationToken)
+    {
+        var results = new List<HeuristicResult>();
+        var signals = new List<HeuristicSignal>();
+
+        foreach (var analyzer in _analyzers)
         {
-            stopwatch.Stop();
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var result = await RunAnalyzerSafelyAsync(analyzer, context, cancellationToken);
+            if (result != null)
+            {
+                results.Add(result);
+                signals.AddRange(result.Signals);
+            }
         }
 
-        // Aggregate score from all analyzers using weighted average
-        var aggregateScore = CalculateAggregateScore(analyzerResults);
+        return (results, signals);
+    }
 
-        // Determine if result is definitive
+    private async Task<HeuristicResult?> RunAnalyzerSafelyAsync(
+        IHeuristicAnalyzer analyzer,
+        HeuristicContext context,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var stopwatch = Stopwatch.StartNew();
+            var result = await analyzer.AnalyzeAsync(context, cancellationToken);
+            stopwatch.Stop();
+
+            _logger.LogDebug(
+                "Heuristic analyzer {AnalyzerName} completed: Score={Score:F3}, Signals={SignalCount}, Duration={Duration}ms",
+                analyzer.AnalyzerName,
+                result.Score,
+                result.Signals.Count,
+                stopwatch.Elapsed.TotalMilliseconds);
+
+            return result;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Heuristic analyzer {AnalyzerName} failed", analyzer.AnalyzerName);
+            return null;
+        }
+    }
+
+    private LayerResult BuildResult(
+        List<HeuristicResult> analyzerResults,
+        List<HeuristicSignal> allSignals,
+        TimeSpan duration)
+    {
+        var aggregateScore = CalculateAggregateScore(analyzerResults);
         var isDefinitiveThreat = aggregateScore >= _heuristicOptions.DefinitiveThreatThreshold;
         var isDefinitiveSafe = aggregateScore <= _heuristicOptions.DefinitiveSafeThreshold;
-        var isThreat = aggregateScore >= 0.5;
 
+        var data = BuildResultData(analyzerResults, allSignals, isDefinitiveThreat, isDefinitiveSafe);
+
+        return new LayerResult
+        {
+            LayerName = LayerName,
+            WasExecuted = true,
+            Confidence = aggregateScore,
+            IsThreat = aggregateScore >= 0.5,
+            Duration = duration,
+            Data = data
+        };
+    }
+
+    private static Dictionary<string, object> BuildResultData(
+        List<HeuristicResult> analyzerResults,
+        List<HeuristicSignal> allSignals,
+        bool isDefinitiveThreat,
+        bool isDefinitiveSafe)
+    {
         var data = new Dictionary<string, object>
         {
             ["signal_count"] = allSignals.Count,
@@ -129,15 +160,10 @@ public sealed class HeuristicLayer
         };
 
         if (isDefinitiveThreat)
-        {
             data["early_exit_reason"] = "definitive_threat";
-        }
         else if (isDefinitiveSafe)
-        {
             data["early_exit_reason"] = "definitive_safe";
-        }
 
-        // Include top signals in data
         var topSignals = allSignals
             .OrderByDescending(s => s.Contribution)
             .Take(5)
@@ -145,20 +171,16 @@ public sealed class HeuristicLayer
             .ToList();
 
         if (topSignals.Count > 0)
-        {
             data["top_signals"] = topSignals;
-        }
 
-        return new LayerResult
-        {
-            LayerName = LayerName,
-            WasExecuted = true,
-            Confidence = aggregateScore,
-            IsThreat = isThreat,
-            Duration = stopwatch.Elapsed,
-            Data = data
-        };
+        return data;
     }
+
+    private LayerResult CreateDisabledResult() => new()
+    {
+        LayerName = LayerName,
+        WasExecuted = false
+    };
 
     private static double CalculateAggregateScore(List<HeuristicResult> results)
     {
@@ -167,8 +189,6 @@ public sealed class HeuristicLayer
             return 0.0;
         }
 
-        // Use weighted average based on analyzer weights
-        // For now, simple average (weights will be added when IHeuristicAnalyzer.Weight is used)
         var aggregateScore = results.Average(r => r.Score);
         return Math.Clamp(aggregateScore, 0.0, 1.0);
     }

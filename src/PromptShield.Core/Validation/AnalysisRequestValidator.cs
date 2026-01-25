@@ -1,4 +1,4 @@
-﻿namespace PromptShield.Core.Validation;
+namespace PromptShield.Core.Validation;
 
 using PromptShield.Abstractions.Analysis;
 
@@ -60,76 +60,62 @@ public sealed class AnalysisRequestValidator
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var errors = new List<string>();
-        var warnings = new List<string>();
+        List<string> errors = [];
+        List<string> warnings = [];
 
-        // Validate prompt is not null or empty
         if (string.IsNullOrWhiteSpace(request.Prompt))
         {
             errors.Add($"{PromptRequiredCode}: Prompt is required and cannot be null or empty.");
             return new ValidationResult(false, errors, warnings);
         }
 
-        // Validate prompt length
-        if (request.Prompt.Length > _maxPromptLength)
-        {
-            errors.Add($"{PromptTooLongCode}: Prompt length ({request.Prompt.Length:N0}) exceeds maximum allowed length ({_maxPromptLength:N0}).");
-        }
-
-        // Validate no forbidden characters (hard fail)
-        var forbiddenFound = FindForbiddenCharacters(request.Prompt);
-        if (forbiddenFound.Count > 0)
-        {
-            var charDescriptions = string.Join(", ", forbiddenFound.Select(c => $"U+{(int)c:X4}"));
-            errors.Add($"{PromptInvalidCharsCode}: Prompt contains forbidden characters: {charDescriptions}");
-        }
-
-        // Check for suspicious characters (warning, doesn't fail)
-        var suspiciousFound = FindSuspiciousCharacters(request.Prompt);
-        if (suspiciousFound.Count > 0)
-        {
-            var charDescriptions = string.Join(", ", suspiciousFound.Take(5).Select(c => $"U+{(int)c:X4}"));
-            var suffix = suspiciousFound.Count > 5 ? $" and {suspiciousFound.Count - 5} more" : "";
-            warnings.Add($"{PromptSuspiciousCharsCode}: Prompt contains suspicious Unicode characters: {charDescriptions}{suffix}");
-        }
-
-        // Validate system prompt if provided
+        ValidateLength(request.Prompt, "Prompt", errors);
+        ValidateCharacters(request.Prompt, errors, warnings);
+        
         if (!string.IsNullOrEmpty(request.SystemPrompt))
-        {
-            if (request.SystemPrompt.Length > _maxPromptLength)
-            {
-                errors.Add($"{PromptTooLongCode}: System prompt length ({request.SystemPrompt.Length:N0}) exceeds maximum allowed length ({_maxPromptLength:N0}).");
-            }
-        }
+            ValidateLength(request.SystemPrompt, "System prompt", errors);
 
         return new ValidationResult(errors.Count == 0, errors, warnings);
     }
 
-    private static List<char> FindForbiddenCharacters(string text)
+    private void ValidateLength(string text, string fieldName, List<string> errors)
     {
-        var found = new List<char>();
-        foreach (var c in text)
+        if (text.Length > _maxPromptLength)
         {
-            if (Array.IndexOf(ForbiddenChars, c) >= 0 && !found.Contains(c))
-            {
-                found.Add(c);
-            }
+            errors.Add($"{PromptTooLongCode}: {fieldName} length ({text.Length:N0}) exceeds maximum allowed length ({_maxPromptLength:N0}).");
         }
-        return found;
     }
 
-    private static List<char> FindSuspiciousCharacters(string text)
+    private static void ValidateCharacters(string text, List<string> errors, List<string> warnings)
     {
-        var found = new List<char>();
+        var forbiddenFound = FindCharactersIn(text, ForbiddenChars);
+        if (forbiddenFound.Count > 0)
+        {
+            errors.Add($"{PromptInvalidCharsCode}: Prompt contains forbidden characters: {FormatCharList(forbiddenFound)}");
+        }
+
+        var suspiciousFound = FindCharactersIn(text, SuspiciousChars);
+        if (suspiciousFound.Count > 0)
+        {
+            var charDescriptions = FormatCharList(suspiciousFound.Take(5));
+            var suffix = suspiciousFound.Count > 5 ? $" and {suspiciousFound.Count - 5} more" : "";
+            warnings.Add($"{PromptSuspiciousCharsCode}: Prompt contains suspicious Unicode characters: {charDescriptions}{suffix}");
+        }
+    }
+
+    private static List<char> FindCharactersIn(string text, char[] targetChars)
+    {
+        HashSet<char> found = [];
         foreach (var c in text)
         {
-            if (Array.IndexOf(SuspiciousChars, c) >= 0 && !found.Contains(c))
-            {
+            if (Array.IndexOf(targetChars, c) >= 0)
                 found.Add(c);
-            }
         }
-        return found;
+        return [.. found];
     }
+
+    private static string FormatCharList(IEnumerable<char> chars)
+        => string.Join(", ", chars.Select(c => $"U+{(int)c:X4}"));
 
     /// <summary>
     /// Result of validation including errors and warnings.
@@ -160,7 +146,7 @@ public sealed class AnalysisRequestValidator
         {
             IsValid = isValid;
             Errors = errors;
-            Warnings = warnings ?? new List<string>();
+            Warnings = warnings ?? [];
         }
     }
 }

@@ -38,10 +38,7 @@ public sealed class PromptShieldFilter : IPromptRenderFilter
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(next);
 
-        // Call next to render the prompt
         await next(context);
-
-        // Get the rendered prompt
         var renderedPrompt = context.RenderedPrompt;
 
         if (_options.SkipEmptyPrompts && string.IsNullOrWhiteSpace(renderedPrompt))
@@ -73,12 +70,10 @@ public sealed class PromptShieldFilter : IPromptRenderFilter
         }
         catch (PromptInjectionDetectedException)
         {
-            // Re-throw prompt injection exceptions - these are intentional blocks
             throw;
         }
         catch (OperationCanceledException)
         {
-            // Re-throw cancellation - let the caller handle it
             _logger.LogDebug("Prompt analysis was cancelled");
             throw;
         }
@@ -90,30 +85,24 @@ public sealed class PromptShieldFilter : IPromptRenderFilter
 
     private AnalysisRequest BuildAnalysisRequest(PromptRenderContext context, string renderedPrompt)
     {
-        var request = new AnalysisRequest
+        return new AnalysisRequest
         {
-            Prompt = renderedPrompt
+            Prompt = renderedPrompt,
+            Metadata = _options.IncludeFunctionMetadata
+                ? CreateMetadata(context)
+                : null
         };
-
-        if (_options.IncludeFunctionMetadata)
-        {
-            request = new AnalysisRequest
-            {
-                Prompt = renderedPrompt,
-                Metadata = new AnalysisMetadata
-                {
-                    Source = "SemanticKernel",
-                    Properties = new Dictionary<string, string>
-                    {
-                        ["FunctionName"] = context.Function.Name,
-                        ["PluginName"] = context.Function.PluginName ?? "Unknown"
-                    }
-                }
-            };
-        }
-
-        return request;
     }
+
+    private static AnalysisMetadata CreateMetadata(PromptRenderContext context) => new()
+    {
+        Source = "SemanticKernel",
+        Properties = new Dictionary<string, string>
+        {
+            ["FunctionName"] = context.Function.Name,
+            ["PluginName"] = context.Function.PluginName ?? "Unknown"
+        }
+    };
 
     private void LogThreatDetected(PromptRenderContext context, AnalysisResult result)
     {
@@ -132,40 +121,25 @@ public sealed class PromptShieldFilter : IPromptRenderFilter
 
     private void HandleAnalysisError(Exception ex, PromptRenderContext context)
     {
-        _logger.LogError(
-            ex,
-            "Error during prompt analysis for function: {FunctionName}",
+        _logger.LogError(ex, "Error during prompt analysis for function: {FunctionName}", context.Function.Name);
+
+        if (_options.OnAnalysisError == FailureBehavior.FailOpen)
+        {
+            _logger.LogWarning(
+                "Allowing prompt to proceed due to analysis error (fail-open behavior). Function: {FunctionName}",
+                context.Function.Name);
+            return;
+        }
+
+        var message = _options.OnAnalysisError == FailureBehavior.FailClosed
+            ? "Prompt analysis failed. The prompt has been blocked for security. See inner exception for details."
+            : "Prompt analysis failed with unknown failure behavior configured.";
+
+        _logger.LogWarning(
+            "Blocking prompt due to analysis error ({Behavior}). Function: {FunctionName}",
+            _options.OnAnalysisError,
             context.Function.Name);
 
-        switch (_options.OnAnalysisError)
-        {
-            case FailureBehavior.FailClosed:
-                _logger.LogWarning(
-                    "Blocking prompt due to analysis error (fail-closed behavior). " +
-                    "Function: {FunctionName}",
-                    context.Function.Name);
-
-                throw new PromptShieldAnalysisException(
-                    "Prompt analysis failed. The prompt has been blocked for security. " +
-                    "See inner exception for details.",
-                    ex);
-
-            case FailureBehavior.FailOpen:
-                _logger.LogWarning(
-                    "Allowing prompt to proceed due to analysis error (fail-open behavior). " +
-                    "Function: {FunctionName}. " +
-                    "WARNING: This may allow malicious prompts through.",
-                    context.Function.Name);
-                break;
-
-            default:
-                // Unknown behavior - default to fail-closed for security
-                _logger.LogWarning(
-                    "Unknown failure behavior configured. Defaulting to fail-closed.");
-
-                throw new PromptShieldAnalysisException(
-                    "Prompt analysis failed with unknown failure behavior configured.",
-                    ex);
-        }
+        throw new PromptShieldAnalysisException(message, ex);
     }
 }

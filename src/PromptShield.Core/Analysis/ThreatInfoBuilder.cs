@@ -11,128 +11,107 @@ namespace PromptShield.Core.Analysis;
 /// </remarks>
 public static class ThreatInfoBuilder
 {
+    private const string DefaultOwaspCategory = "LLM01";
+    private const string DefaultThreatType = "Prompt Injection";
+    private const string DefaultUserMessage = "Your request could not be processed due to security concerns. " +
+                                              "Please rephrase your message and try again.";
+
     /// <summary>
     /// Builds ThreatInfo from pattern matching and heuristic layer results.
     /// </summary>
-    /// <param name="patternResult">Result from pattern matching layer.</param>
-    /// <param name="heuristicResult">Result from heuristic analysis layer.</param>
-    /// <param name="aggregateConfidence">Aggregated confidence score.</param>
-    /// <returns>ThreatInfo if threat detected, null otherwise.</returns>
     public static ThreatInfo? Build(
         LayerResult patternResult,
         LayerResult heuristicResult,
         double aggregateConfidence)
-    {
-        return Build(patternResult, heuristicResult, mlResult: null, aggregateConfidence);
-    }
+        => Build(patternResult, heuristicResult, mlResult: null, aggregateConfidence);
 
     /// <summary>
     /// Builds ThreatInfo from pattern matching, heuristic, and ML layer results.
     /// </summary>
-    /// <param name="patternResult">Result from pattern matching layer.</param>
-    /// <param name="heuristicResult">Result from heuristic analysis layer.</param>
-    /// <param name="mlResult">Result from ML classification layer (optional).</param>
-    /// <param name="aggregateConfidence">Aggregated confidence score.</param>
-    /// <returns>ThreatInfo if threat detected, null otherwise.</returns>
     public static ThreatInfo? Build(
         LayerResult patternResult,
         LayerResult heuristicResult,
         LayerResult? mlResult,
         double aggregateConfidence)
     {
-        var owaspCategory = "LLM01"; // Default
-        var matchedPatterns = new List<string>();
-        var detectionSources = new List<string>();
+        var ctx = new ThreatContext();
 
-        // Extract information from pattern matching layer
-        if (patternResult.IsThreat == true && patternResult.Data != null)
-        {
-            if (patternResult.Data.TryGetValue("owasp_category", out var category))
-            {
-                owaspCategory = category.ToString() ?? "LLM01";
-            }
-            
-            if (patternResult.Data.TryGetValue("matched_patterns", out var patterns) &&
-                patterns is List<string> patternList)
-            {
-                matchedPatterns.AddRange(patternList);
-            }
-            
-            detectionSources.Add("PatternMatching");
-        }
+        ctx.ProcessPatternResult(patternResult);
+        ctx.ProcessLayerResult(heuristicResult, "Heuristics");
+        ctx.ProcessLayerResult(mlResult, "MLClassification");
 
-        // Extract information from heuristic layer
-        if (heuristicResult.IsThreat == true)
-        {
-            detectionSources.Add("Heuristics");
-        }
-
-        // Extract information from ML classification layer
-        if (mlResult != null && mlResult.IsThreat == true)
-        {
-            detectionSources.Add("MLClassification");
-        }
-
-        // Only create ThreatInfo if at least one source detected a threat
-        if (detectionSources.Count == 0)
-        {
+        if (ctx.DetectionSources.Count == 0)
             return null;
-        }
 
-        var severity = aggregateConfidence.ToSeverity();
-
-        return new ThreatInfo
-        {
-            OwaspCategory = owaspCategory,
-            ThreatType = "Prompt Injection",
-            Explanation = $"Potential prompt injection detected with confidence {aggregateConfidence:P0}. " +
-                         $"Detected by: {string.Join(", ", detectionSources)}.",
-            UserFacingMessage = "Your request could not be processed due to security concerns. " +
-                               "Please rephrase your message and try again.",
-            Severity = severity,
-            DetectionSources = detectionSources,
-            MatchedPatterns = matchedPatterns.Count > 0 ? matchedPatterns : null
-        };
+        return CreateThreatInfo(
+            ctx,
+            $"Potential prompt injection detected with confidence {aggregateConfidence:P0}. " +
+            $"Detected by: {string.Join(", ", ctx.DetectionSources)}.",
+            aggregateConfidence);
     }
 
     /// <summary>
     /// Builds ThreatInfo from a single layer result (for early exit scenarios).
     /// </summary>
-    /// <param name="layerResult">Result from the deciding layer.</param>
-    /// <param name="decisionLayer">Name of the layer that made the decision.</param>
-    /// <param name="confidence">Confidence score from the layer.</param>
-    /// <returns>ThreatInfo if threat detected, null otherwise.</returns>
     public static ThreatInfo? BuildFromSingleLayer(
         LayerResult layerResult,
         string decisionLayer,
         double confidence)
     {
-        if (layerResult.IsThreat != true || layerResult.Data == null)
-        {
+        if (layerResult.IsThreat != true)
             return null;
+
+        var ctx = new ThreatContext();
+        ctx.ProcessPatternResult(layerResult);
+        ctx.DetectionSources.Add(decisionLayer);
+
+        return CreateThreatInfo(
+            ctx,
+            $"Threat detected by {decisionLayer} layer with {confidence:P0} confidence.",
+            confidence);
+    }
+
+    private static ThreatInfo CreateThreatInfo(ThreatContext ctx, string explanation, double confidence) => new()
+    {
+        OwaspCategory = ctx.OwaspCategory,
+        ThreatType = DefaultThreatType,
+        Explanation = explanation,
+        UserFacingMessage = DefaultUserMessage,
+        Severity = confidence.ToSeverity(),
+        DetectionSources = ctx.DetectionSources,
+        MatchedPatterns = ctx.MatchedPatterns.Count > 0 ? ctx.MatchedPatterns : null
+    };
+
+    /// <summary>
+    /// Accumulates threat detection context from multiple layers.
+    /// </summary>
+    private sealed class ThreatContext
+    {
+        public string OwaspCategory { get; private set; } = DefaultOwaspCategory;
+        public List<string> MatchedPatterns { get; } = [];
+        public List<string> DetectionSources { get; } = [];
+
+        public void ProcessPatternResult(LayerResult? result)
+        {
+            if (result?.IsThreat != true || result.Data == null)
+                return;
+
+            if (result.Data.TryGetValue("owasp_category", out var category))
+                OwaspCategory = category?.ToString() ?? DefaultOwaspCategory;
+
+            if (result.Data.TryGetValue("matched_patterns", out var patterns) &&
+                patterns is List<string> patternList)
+            {
+                MatchedPatterns.AddRange(patternList);
+            }
+
+            DetectionSources.Add("PatternMatching");
         }
 
-        var owaspCategory = layerResult.Data.TryGetValue("owasp_category", out var cat)
-            ? cat.ToString() ?? "LLM01"
-            : "LLM01";
-
-        var matchedPatterns = layerResult.Data.TryGetValue("matched_patterns", out var patterns) &&
-                             patterns is List<string> patternList
-            ? patternList
-            : null;
-
-        var severity = confidence.ToSeverity();
-
-        return new ThreatInfo
+        public void ProcessLayerResult(LayerResult? result, string layerName)
         {
-            OwaspCategory = owaspCategory,
-            ThreatType = "Prompt Injection",
-            Explanation = $"Threat detected by {decisionLayer} layer with {confidence:P0} confidence.",
-            UserFacingMessage = "Your request could not be processed due to security concerns. " +
-                               "Please rephrase your message and try again.",
-            Severity = severity,
-            DetectionSources = new[] { decisionLayer },
-            MatchedPatterns = matchedPatterns
-        };
+            if (result?.IsThreat == true)
+                DetectionSources.Add(layerName);
+        }
     }
 }

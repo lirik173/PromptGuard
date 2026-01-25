@@ -21,6 +21,76 @@ public sealed class PatternMatchingLayer
     private readonly HashSet<string> _disabledPatternIds;
     private readonly List<Regex> _allowlistRegex;
 
+    /// <summary>
+    /// Accumulates pattern analysis state during scanning.
+    /// </summary>
+    private sealed class PatternAnalysisContext
+    {
+        private readonly PatternMatchingOptions _options;
+
+        public List<string> MatchedPatterns { get; } = [];
+        public List<string> TimedOutPatterns { get; } = [];
+        public double HighestConfidence { get; private set; }
+        public ThreatSeverity HighestSeverity { get; private set; } = ThreatSeverity.Low;
+        public string? PrimaryOwaspCategory { get; private set; }
+
+        public PatternAnalysisContext(PatternMatchingOptions options)
+        {
+            _options = options;
+        }
+
+        public void RecordTimeout(string patternName, double timeoutContribution)
+        {
+            TimedOutPatterns.Add(patternName);
+            if (timeoutContribution > HighestConfidence)
+                HighestConfidence = timeoutContribution;
+        }
+
+        public void RecordMatch(CompiledPattern pattern, double adjustedConfidence)
+        {
+            MatchedPatterns.Add(pattern.Pattern.Name);
+
+            if (adjustedConfidence > HighestConfidence)
+            {
+                HighestConfidence = adjustedConfidence;
+                PrimaryOwaspCategory = pattern.Pattern.OwaspCategory;
+                HighestSeverity = pattern.Pattern.Severity;
+            }
+        }
+
+        public bool IsThreat => MatchedPatterns.Count > 0;
+
+        public Dictionary<string, object> BuildResultData(int disabledPatternCount)
+        {
+            var data = new Dictionary<string, object>
+            {
+                ["matched_patterns"] = MatchedPatterns,
+                ["pattern_count"] = MatchedPatterns.Count,
+                ["sensitivity"] = _options.Sensitivity.ToString()
+            };
+
+            if (TimedOutPatterns.Count > 0)
+            {
+                data["timed_out_patterns"] = TimedOutPatterns;
+                data["timeout_count"] = TimedOutPatterns.Count;
+                data["has_timeouts"] = true;
+            }
+
+            if (IsThreat)
+            {
+                data["owasp_category"] = PrimaryOwaspCategory ?? "LLM01";
+                data["severity"] = HighestSeverity.ToString();
+            }
+
+            if (disabledPatternCount > 0)
+            {
+                data["disabled_patterns_count"] = disabledPatternCount;
+            }
+
+            return data;
+        }
+    }
+
     public PatternMatchingLayer(
         IEnumerable<IPatternProvider> patternProviders,
         PatternMatchingOptions options,
@@ -28,7 +98,7 @@ public sealed class PatternMatchingLayer
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? NullLogger<PatternMatchingLayer>.Instance;
-        _compiledPatterns = new List<CompiledPattern>();
+        _compiledPatterns = [];
         _disabledPatternIds = new HashSet<string>(options.DisabledPatternIds, StringComparer.OrdinalIgnoreCase);
         _allowlistRegex = CompileAllowlistPatterns(options.AllowedPatterns);
 
@@ -49,15 +119,8 @@ public sealed class PatternMatchingLayer
         CancellationToken cancellationToken = default)
     {
         if (!_options.Enabled)
-        {
-            return Task.FromResult(new LayerResult
-            {
-                LayerName = LayerName,
-                WasExecuted = false
-            });
-        }
+            return Task.FromResult(CreateDisabledResult());
 
-        // Check allowlist first
         if (IsAllowlisted(prompt))
         {
             _logger.LogDebug("Prompt matched pattern allowlist, skipping pattern matching");
@@ -65,71 +128,13 @@ public sealed class PatternMatchingLayer
         }
 
         var stopwatch = Stopwatch.StartNew();
-        var matchedPatterns = new List<string>();
-        var timedOutPatterns = new List<string>();
-        var highestConfidence = 0.0;
-        var highestSeverity = ThreatSeverity.Low;
-        string? primaryOwaspCategory = null;
-
-        // Get sensitivity-adjusted values
-        var timeoutContribution = GetAdjustedTimeoutContribution();
+        var ctx = new PatternAnalysisContext(_options);
         var earlyExitThreshold = GetAdjustedEarlyExitThreshold();
+        var timeoutContribution = GetAdjustedTimeoutContribution();
 
         try
         {
-            foreach (var pattern in _compiledPatterns)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                var matchResult = pattern.TryMatch(prompt);
-
-                if (matchResult.TimedOut)
-                {
-                    timedOutPatterns.Add(pattern.Pattern.Name);
-
-                    _logger.LogWarning(
-                        "Pattern timeout detected (potential ReDoS): {PatternName} ({PatternId})",
-                        pattern.Pattern.Name,
-                        pattern.Pattern.Id);
-
-                    // Timeout contributes to suspicion score
-                    if (timeoutContribution > highestConfidence)
-                    {
-                        highestConfidence = timeoutContribution;
-                    }
-
-                    continue;
-                }
-
-                if (matchResult.IsMatch)
-                {
-                    matchedPatterns.Add(pattern.Pattern.Name);
-
-                    var patternConfidence = GetAdjustedConfidence(pattern.Pattern.Severity.ToConfidence());
-
-                    if (patternConfidence > highestConfidence)
-                    {
-                        highestConfidence = patternConfidence;
-                        primaryOwaspCategory = pattern.Pattern.OwaspCategory;
-                        highestSeverity = pattern.Pattern.Severity;
-                    }
-
-                    _logger.LogDebug(
-                        "Pattern matched: {PatternName} (Confidence: {Confidence:F3}, Severity: {Severity})",
-                        pattern.Pattern.Name,
-                        patternConfidence,
-                        pattern.Pattern.Severity);
-
-                    // Early exit if high confidence match
-                    if (patternConfidence >= earlyExitThreshold)
-                    {
-                        _logger.LogInformation(
-                            "Early exit triggered by high-confidence pattern: {PatternName}",
-                            pattern.Pattern.Name);
-                        break;
-                    }
-                }
-            }
+            var shouldEarlyExit = ScanPatterns(prompt, ctx, earlyExitThreshold, timeoutContribution, cancellationToken);
         }
         catch (OperationCanceledException)
         {
@@ -139,56 +144,94 @@ public sealed class PatternMatchingLayer
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error during pattern matching");
-            // Continue with partial results
         }
         finally
         {
             stopwatch.Stop();
         }
 
-        var isThreat = matchedPatterns.Count > 0;
-        var data = new Dictionary<string, object>
-        {
-            ["matched_patterns"] = matchedPatterns,
-            ["pattern_count"] = matchedPatterns.Count,
-            ["sensitivity"] = _options.Sensitivity.ToString()
-        };
-
-        // Include timeout information for downstream layers
-        if (timedOutPatterns.Count > 0)
-        {
-            data["timed_out_patterns"] = timedOutPatterns;
-            data["timeout_count"] = timedOutPatterns.Count;
-            data["has_timeouts"] = true;
-        }
-
-        if (isThreat)
-        {
-            data["owasp_category"] = primaryOwaspCategory ?? "LLM01";
-            data["severity"] = highestSeverity.ToString();
-        }
-
-        if (_disabledPatternIds.Count > 0)
-        {
-            data["disabled_patterns_count"] = _disabledPatternIds.Count;
-        }
-
         return Task.FromResult(new LayerResult
         {
             LayerName = LayerName,
             WasExecuted = true,
-            Confidence = highestConfidence,
-            IsThreat = isThreat,
+            Confidence = ctx.HighestConfidence,
+            IsThreat = ctx.IsThreat,
             Duration = stopwatch.Elapsed,
-            Data = data
+            Data = ctx.BuildResultData(_disabledPatternIds.Count)
         });
     }
 
-    #region Allowlist
+    private bool ScanPatterns(
+        string prompt,
+        PatternAnalysisContext ctx,
+        double earlyExitThreshold,
+        double timeoutContribution,
+        CancellationToken cancellationToken)
+    {
+        foreach (var pattern in _compiledPatterns)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var matchResult = pattern.TryMatch(prompt);
+
+            if (matchResult.TimedOut)
+            {
+                HandlePatternTimeout(pattern, ctx, timeoutContribution);
+                continue;
+            }
+
+            if (matchResult.IsMatch)
+            {
+                var shouldExit = HandlePatternMatch(pattern, ctx, earlyExitThreshold);
+                if (shouldExit)
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void HandlePatternTimeout(CompiledPattern pattern, PatternAnalysisContext ctx, double timeoutContribution)
+    {
+        _logger.LogWarning(
+            "Pattern timeout detected (potential ReDoS): {PatternName} ({PatternId})",
+            pattern.Pattern.Name,
+            pattern.Pattern.Id);
+
+        ctx.RecordTimeout(pattern.Pattern.Name, timeoutContribution);
+    }
+
+    private bool HandlePatternMatch(CompiledPattern pattern, PatternAnalysisContext ctx, double earlyExitThreshold)
+    {
+        var patternConfidence = GetAdjustedConfidence(pattern.Pattern.Severity.ToConfidence());
+        ctx.RecordMatch(pattern, patternConfidence);
+
+        _logger.LogDebug(
+            "Pattern matched: {PatternName} (Confidence: {Confidence:F3}, Severity: {Severity})",
+            pattern.Pattern.Name,
+            patternConfidence,
+            pattern.Pattern.Severity);
+
+        if (patternConfidence >= earlyExitThreshold)
+        {
+            _logger.LogInformation(
+                "Early exit triggered by high-confidence pattern: {PatternName}",
+                pattern.Pattern.Name);
+            return true;
+        }
+
+        return false;
+    }
+
+    private LayerResult CreateDisabledResult() => new()
+    {
+        LayerName = LayerName,
+        WasExecuted = false
+    };
 
     private List<Regex> CompileAllowlistPatterns(List<string> patterns)
     {
-        var compiled = new List<Regex>();
+        List<Regex> compiled = [];
         foreach (var pattern in patterns)
         {
             try
@@ -217,7 +260,6 @@ public sealed class PatternMatchingLayer
             }
             catch (RegexMatchTimeoutException)
             {
-                // Timeout on allowlist - don't allow
             }
         }
         return false;
@@ -235,10 +277,6 @@ public sealed class PatternMatchingLayer
             ["reason"] = "Prompt matched allowlist pattern"
         }
     };
-
-    #endregion
-
-    #region Sensitivity Adjustments
 
     private double GetAdjustedTimeoutContribution()
     {
@@ -278,12 +316,10 @@ public sealed class PatternMatchingLayer
         };
     }
 
-    #endregion
-
     private void CompilePatterns(IEnumerable<IPatternProvider> providers)
     {
         var timeout = TimeSpan.FromMilliseconds(_options.TimeoutMs);
-        var allPatterns = new List<DetectionPattern>();
+        List<DetectionPattern> allPatterns = [];
 
         foreach (var provider in providers)
         {

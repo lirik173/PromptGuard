@@ -119,31 +119,18 @@ public sealed class MLClassificationLayer : IDisposable
         _globalOptions = globalOptions ?? throw new ArgumentNullException(nameof(globalOptions));
         _logger = logger ?? NullLogger<MLClassificationLayer>.Instance;
 
-        // Initialize model loader
         _modelLoader = new ModelLoader(_options.ModelPath, logger: null);
-
-        // Initialize tokenizer with subword strategy for better coverage
         _tokenizer = new SimpleTokenizer(
             _options.MaxSequenceLength,
             strategy: SimpleTokenizer.TokenizationStrategy.Subword,
             addSpecialTokens: true,
             lowercase: true);
-
-        // Initialize feature extractor for statistical analysis
         _featureExtractor = new FeatureExtractor();
-
-        // Limit concurrent inference to prevent resource exhaustion
         _inferenceSemaphore = new SemaphoreSlim(
             _options.MaxConcurrentInferences,
             _options.MaxConcurrentInferences);
-
-        // Compile allowlist patterns
         _allowlistRegex = CompileAllowlistPatterns(options.AllowedPatterns);
-
-        // Build feature weight overrides from configuration
         _featureWeightOverrides = BuildFeatureWeightOverrides(options.FeatureWeights);
-
-        // Build disabled feature indices
         _disabledFeatureIndices = BuildDisabledFeatureIndices(options.DisabledFeatures);
 
         LogInitializationStatus();
@@ -165,11 +152,8 @@ public sealed class MLClassificationLayer : IDisposable
         CancellationToken cancellationToken = default)
     {
         if (!_options.Enabled)
-        {
             return CreateDisabledResult();
-        }
 
-        // Check allowlist first
         if (IsAllowlisted(prompt))
         {
             _logger.LogDebug("Prompt matched ML allowlist pattern, skipping classification");
@@ -178,12 +162,28 @@ public sealed class MLClassificationLayer : IDisposable
 
         var stopwatch = Stopwatch.StartNew();
 
+        var acquireResult = await TryAcquireSemaphoreAsync(stopwatch, cancellationToken);
+        if (acquireResult != null)
+            return acquireResult;
+
         try
         {
-            // Acquire inference semaphore with timeout
-            var acquired = await _inferenceSemaphore.WaitAsync(
-                TimeSpan.FromSeconds(_options.InferenceTimeoutSeconds / 2),
-                cancellationToken);
+            return await ExecuteClassificationAsync(prompt, stopwatch, cancellationToken);
+        }
+        finally
+        {
+            _inferenceSemaphore.Release();
+        }
+    }
+
+    private async Task<LayerResult?> TryAcquireSemaphoreAsync(
+        Stopwatch stopwatch,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var timeout = TimeSpan.FromSeconds(_options.InferenceTimeoutSeconds / 2);
+            var acquired = await _inferenceSemaphore.WaitAsync(timeout, cancellationToken);
 
             if (!acquired)
             {
@@ -191,22 +191,30 @@ public sealed class MLClassificationLayer : IDisposable
                 return CreateConcurrencyLimitResult(stopwatch.Elapsed);
             }
 
-            try
-            {
-                cancellationToken.ThrowIfCancellationRequested();
+            return null;
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogDebug("ML classification was cancelled during semaphore acquisition");
+            throw;
+        }
+    }
 
-                var result = await Task.Run(
-                    () => PerformClassification(prompt, cancellationToken),
-                    cancellationToken);
+    private async Task<LayerResult> ExecuteClassificationAsync(
+        string prompt,
+        Stopwatch stopwatch,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
 
-                stopwatch.Stop();
+            var result = await Task.Run(
+                () => PerformClassification(prompt, cancellationToken),
+                cancellationToken);
 
-                return CreateSuccessResult(result, stopwatch.Elapsed);
-            }
-            finally
-            {
-                _inferenceSemaphore.Release();
-            }
+            stopwatch.Stop();
+            return CreateSuccessResult(result, stopwatch.Elapsed);
         }
         catch (OperationCanceledException)
         {
@@ -221,11 +229,9 @@ public sealed class MLClassificationLayer : IDisposable
         }
     }
 
-    #region Allowlist
-
     private List<Regex> CompileAllowlistPatterns(List<string> patterns)
     {
-        var compiled = new List<Regex>();
+        List<Regex> compiled = [];
         foreach (var pattern in patterns)
         {
             try
@@ -248,30 +254,21 @@ public sealed class MLClassificationLayer : IDisposable
             try
             {
                 if (regex.IsMatch(prompt))
-                {
                     return true;
-                }
             }
             catch (RegexMatchTimeoutException)
             {
-                // Timeout on allowlist - don't allow
             }
         }
         return false;
     }
 
-    #endregion
-
-    #region Feature Weight Configuration
-
     private Dictionary<int, double> BuildFeatureWeightOverrides(Dictionary<string, double>? customWeights)
     {
-        var overrides = new Dictionary<int, double>();
+        Dictionary<int, double> overrides = [];
 
-        if (customWeights == null || customWeights.Count == 0)
-        {
+        if (customWeights is not { Count: > 0 })
             return overrides;
-        }
 
         foreach (var (name, weight) in customWeights)
         {
@@ -291,8 +288,7 @@ public sealed class MLClassificationLayer : IDisposable
 
     private HashSet<int> BuildDisabledFeatureIndices(List<string> disabledFeatures)
     {
-        var indices = new HashSet<int>();
-
+        HashSet<int> indices = [];
         foreach (var name in disabledFeatures)
         {
             if (FeatureNameToIndex.TryGetValue(name, out var index))
@@ -309,26 +305,16 @@ public sealed class MLClassificationLayer : IDisposable
         return indices;
     }
 
-    #endregion
-
-    /// <summary>
-    /// Performs the ML classification using available inference modes.
-    /// </summary>
     private ClassificationResult PerformClassification(string prompt, CancellationToken cancellationToken)
     {
-        // Extract features for statistical analysis
         var features = _featureExtractor.ExtractFeatures(prompt);
         var topFeatures = IdentifyTopContributingFeatures(features);
 
-        // If ONNX model is available, use neural network inference
-        if (_modelLoader.IsAvailable && _modelLoader.Session != null)
+        if (_modelLoader is { IsAvailable: true, Session: not null })
         {
             try
             {
-                // Tokenize for sequence model
                 var (tokenIds, attentionMask) = _tokenizer.TokenizeWithAttention(prompt);
-
-                // Run model inference
                 var modelPrediction = RunModelInference(tokenIds, attentionMask, _modelLoader.Session);
 
                 // Combine with feature-based heuristic for ensemble
@@ -367,9 +353,6 @@ public sealed class MLClassificationLayer : IDisposable
         };
     }
 
-    /// <summary>
-    /// Runs inference on the ONNX model.
-    /// </summary>
     private double RunModelInference(int[] tokenIds, int[] attentionMask, InferenceSession session)
     {
         // Determine input requirements from model metadata
@@ -385,34 +368,27 @@ public sealed class MLClassificationLayer : IDisposable
             inputNames.FirstOrDefault(n => n.Contains("input", StringComparison.OrdinalIgnoreCase)) ?? "input_ids",
             tokenTensor));
 
-        // Add attention mask if model expects it
-        if (inputNames.Any(n => n.Contains("attention", StringComparison.OrdinalIgnoreCase) ||
-                                n.Contains("mask", StringComparison.OrdinalIgnoreCase)))
+        var attentionInputName = inputNames.FirstOrDefault(n => 
+            n.Contains("attention", StringComparison.OrdinalIgnoreCase) ||
+            n.Contains("mask", StringComparison.OrdinalIgnoreCase));
+        
+        if (attentionInputName is not null)
         {
-            var attentionShape = new[] { 1, attentionMask.Length };
             var longAttentionMask = Array.ConvertAll(attentionMask, x => (long)x);
-            var attentionTensor = new DenseTensor<long>(longAttentionMask, attentionShape);
-
-            inputs.Add(NamedOnnxValue.CreateFromTensor(
-                inputNames.First(n => n.Contains("attention", StringComparison.OrdinalIgnoreCase) ||
-                                      n.Contains("mask", StringComparison.OrdinalIgnoreCase)),
-                attentionTensor));
+            var attentionTensor = new DenseTensor<long>(longAttentionMask, [1, attentionMask.Length]);
+            inputs.Add(NamedOnnxValue.CreateFromTensor(attentionInputName, attentionTensor));
         }
 
-        // Add token type IDs if model expects them (for BERT-style models)
-        if (inputNames.Any(n => n.Contains("token_type", StringComparison.OrdinalIgnoreCase) ||
-                                n.Contains("segment", StringComparison.OrdinalIgnoreCase)))
+        var tokenTypeInputName = inputNames.FirstOrDefault(n => 
+            n.Contains("token_type", StringComparison.OrdinalIgnoreCase) ||
+            n.Contains("segment", StringComparison.OrdinalIgnoreCase));
+        
+        if (tokenTypeInputName is not null)
         {
-            var typeIdsShape = new[] { 1, tokenIds.Length };
-            var typeIdsTensor = new DenseTensor<long>(new long[tokenIds.Length], typeIdsShape);
-
-            inputs.Add(NamedOnnxValue.CreateFromTensor(
-                inputNames.First(n => n.Contains("token_type", StringComparison.OrdinalIgnoreCase) ||
-                                      n.Contains("segment", StringComparison.OrdinalIgnoreCase)),
-                typeIdsTensor));
+            var typeIdsTensor = new DenseTensor<long>(new long[tokenIds.Length], [1, tokenIds.Length]);
+            inputs.Add(NamedOnnxValue.CreateFromTensor(tokenTypeInputName, typeIdsTensor));
         }
 
-        // Run inference
         using var results = session.Run(inputs);
 
         var output = results.FirstOrDefault()
@@ -421,9 +397,6 @@ public sealed class MLClassificationLayer : IDisposable
         return ExtractProbabilityFromOutput(output);
     }
 
-    /// <summary>
-    /// Extracts threat probability from model output tensor.
-    /// </summary>
     private static double ExtractProbabilityFromOutput(DisposableNamedOnnxValue output)
     {
         var tensor = output.AsTensor<float>();
@@ -431,68 +404,38 @@ public sealed class MLClassificationLayer : IDisposable
 
         if (values.Length >= 2)
         {
-            // Binary classification: apply softmax and return threat probability
             var probabilities = Softmax(values);
-            return probabilities[1]; // Index 1 = threat class
+            return probabilities[1];
         }
-        else if (values.Length == 1)
-        {
-            // Single output: sigmoid activation assumed
+        
+        if (values.Length == 1)
             return Sigmoid(values[0]);
-        }
 
         throw new InvalidOperationException($"Unexpected output shape: {values.Length} elements");
     }
 
-    /// <summary>
-    /// Calculates a threat score from extracted features using configurable weighted heuristics.
-    /// </summary>
     private double CalculateFeatureScore(float[] features)
     {
         var score = 0.0;
         var minContribution = _options.MinFeatureContribution;
         var sensitivityMultiplier = GetSensitivityMultiplier();
 
-        foreach (var (index, (name, defaultWeight)) in DefaultFeatureWeights)
+        foreach (var (index, (_, defaultWeight)) in DefaultFeatureWeights)
         {
-            // Skip disabled features
-            if (_disabledFeatureIndices.Contains(index))
-            {
+            if (_disabledFeatureIndices.Contains(index) || index >= features.Length)
                 continue;
-            }
-
-            // Get feature value
-            if (index >= features.Length)
-            {
-                continue;
-            }
 
             var featureValue = features[index];
-
-            // Skip features below minimum contribution threshold
             if (featureValue < minContribution)
-            {
                 continue;
-            }
 
-            // Get weight (override or default)
-            var weight = _featureWeightOverrides.TryGetValue(index, out var overrideWeight)
-                ? overrideWeight
-                : defaultWeight;
-
-            // Apply sensitivity adjustment
-            var adjustedWeight = weight * sensitivityMultiplier;
-
-            score += featureValue * adjustedWeight;
+            var weight = _featureWeightOverrides.GetValueOrDefault(index, defaultWeight);
+            score += featureValue * weight * sensitivityMultiplier;
         }
 
-        // Normalize to 0-1 range using sigmoid
         return Sigmoid(score * 2 - 2);
     }
 
-    /// <summary>
-    /// Gets the sensitivity multiplier based on configured sensitivity level.
-    /// </summary>
     private double GetSensitivityMultiplier()
     {
         return _options.Sensitivity switch
@@ -505,16 +448,10 @@ public sealed class MLClassificationLayer : IDisposable
         };
     }
 
-    /// <summary>
-    /// Combines model prediction with feature-based score using weighted ensemble.
-    /// </summary>
     private double CombineScores(double modelScore, double featureScore)
     {
-        // Use configured model weight
         var baseModelWeight = _options.ModelWeight;
-
-        // Adjust based on model confidence (more weight when confident)
-        var modelConfidence = Math.Abs(modelScore - 0.5) * 2; // 0 at 0.5, 1 at extremes
+        var modelConfidence = Math.Abs(modelScore - 0.5) * 2;
         var modelWeight = baseModelWeight + (modelConfidence * (1.0 - baseModelWeight) * 0.3);
         var featureWeight = 1.0 - modelWeight;
 
@@ -522,9 +459,6 @@ public sealed class MLClassificationLayer : IDisposable
         return Math.Clamp(combined, 0.0, 1.0);
     }
 
-    /// <summary>
-    /// Identifies top contributing features for explainability.
-    /// </summary>
     private string[] IdentifyTopContributingFeatures(float[] features)
     {
         var featureNames = new[]
@@ -552,8 +486,6 @@ public sealed class MLClassificationLayer : IDisposable
             .ToArray();
     }
 
-    #region Mathematical Functions
-
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static double[] Softmax(float[] logits)
     {
@@ -568,10 +500,6 @@ public sealed class MLClassificationLayer : IDisposable
     {
         return 1.0 / (1.0 + Math.Exp(-x));
     }
-
-    #endregion
-
-    #region Result Factory Methods
 
     private LayerResult CreateDisabledResult() => new()
     {
@@ -664,8 +592,6 @@ public sealed class MLClassificationLayer : IDisposable
             Data = data
         };
     }
-
-    #endregion
 
     private void LogInitializationStatus()
     {

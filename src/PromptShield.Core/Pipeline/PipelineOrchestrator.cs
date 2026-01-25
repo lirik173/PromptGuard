@@ -35,6 +35,21 @@ public sealed class PipelineOrchestrator
     private readonly SemanticAnalysisLayer? _semanticLayer;
     private readonly ILogger<PipelineOrchestrator> _logger;
 
+    /// <summary>
+    /// Encapsulates pipeline execution state to reduce parameter passing.
+    /// </summary>
+    private sealed class PipelineContext
+    {
+        public required Guid AnalysisId { get; init; }
+        public required DateTimeOffset Timestamp { get; init; }
+        public required Stopwatch Stopwatch { get; init; }
+        public List<string> ExecutedLayers { get; } = [];
+        public LanguageFilterResult? LanguageFilterResult { get; set; }
+        public LayerResult? PatternResult { get; set; }
+        public LayerResult? HeuristicResult { get; set; }
+        public LayerResult? MlResult { get; set; }
+    }
+
     public PipelineOrchestrator(
         PatternMatchingLayer patternLayer,
         HeuristicLayer heuristicLayer,
@@ -71,10 +86,12 @@ public sealed class PipelineOrchestrator
         Guid analysisId,
         CancellationToken cancellationToken = default)
     {
-        var timestamp = DateTimeOffset.UtcNow;
-        var overallStopwatch = Stopwatch.StartNew();
-        var executedLayers = new List<string>();
-        LanguageFilterResult? languageFilterResult = null;
+        var ctx = new PipelineContext
+        {
+            AnalysisId = analysisId,
+            Timestamp = DateTimeOffset.UtcNow,
+            Stopwatch = Stopwatch.StartNew()
+        };
 
         _logger.LogInformation(
             "Starting analysis pipeline for AnalysisId={AnalysisId}, PromptLength={Length}",
@@ -83,201 +100,28 @@ public sealed class PipelineOrchestrator
 
         try
         {
-            // Layer 0: Language Filter (gate)
-            if (_languageFilterLayer != null && _options.Language.Enabled)
-            {
-                languageFilterResult = await _languageFilterLayer.AnalyzeAsync(
-                    request.Prompt,
-                    cancellationToken);
+            // Stage 1: Language Filter
+            var languageBlockResult = await ExecuteLanguageFilterAsync(ctx, request.Prompt, cancellationToken);
+            if (languageBlockResult != null)
+                return languageBlockResult;
 
-                if (languageFilterResult.WasExecuted)
-                {
-                    executedLayers.Add(_languageFilterLayer.LayerName);
+            // Stage 2: Pattern Matching
+            var patternEarlyExit = await ExecutePatternMatchingAsync(ctx, request.Prompt, cancellationToken);
+            if (patternEarlyExit != null)
+                return patternEarlyExit;
 
-                    _logger.LogDebug(
-                        "Language filter: ShouldProceed={ShouldProceed}, Language={Language}",
-                        languageFilterResult.ShouldProceed,
-                        languageFilterResult.LanguageResult?.LanguageName ?? "unknown");
+            // Stage 3: Heuristics
+            var heuristicEarlyExit = await ExecuteHeuristicLayerAsync(ctx, request.Prompt, cancellationToken);
+            if (heuristicEarlyExit != null)
+                return heuristicEarlyExit;
 
-                    // Block if language not supported
-                    if (!languageFilterResult.ShouldProceed && languageFilterResult.IsBlocked)
-                    {
-                        _logger.LogInformation(
-                            "Request blocked by language filter: {Message}",
-                            languageFilterResult.Message);
+            // Stage 4: ML Classification (conditional)
+            var mlEarlyExit = await ExecuteMLLayerAsync(ctx, request.Prompt, cancellationToken);
+            if (mlEarlyExit != null)
+                return mlEarlyExit;
 
-                        return CreateLanguageBlockResult(
-                            analysisId,
-                            timestamp,
-                            overallStopwatch,
-                            languageFilterResult,
-                            executedLayers);
-                    }
-                }
-            }
-
-            // Layer 1: Pattern Matching
-            LayerResult patternResult;
-            try
-            {
-                patternResult = await _patternLayer.AnalyzeAsync(request.Prompt, cancellationToken);
-                executedLayers.Add(_patternLayer.LayerName);
-
-                _logger.LogDebug(
-                    "Pattern matching: IsThreat={IsThreat}, Confidence={Confidence:P0}",
-                    patternResult.IsThreat,
-                    patternResult.Confidence);
-
-                // Early exit on high-confidence pattern match
-                if (patternResult.IsThreat == true &&
-                    patternResult.Confidence >= _options.PatternMatching.EarlyExitThreshold)
-                {
-                    _logger.LogInformation(
-                        "Early exit: pattern matching (Confidence={Confidence:P0})",
-                        patternResult.Confidence);
-
-                    return CreateResult(
-                        analysisId,
-                        timestamp,
-                        overallStopwatch,
-                        languageFilterResult,
-                        patternResult,
-                        heuristicResult: null,
-                        mlResult: null,
-                        executedLayers,
-                        _patternLayer.LayerName);
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Pattern matching layer failed");
-                patternResult = CreateFailedLayerResult(_patternLayer.LayerName);
-            }
-
-            // Layer 2: Heuristic Analysis
-            LayerResult heuristicResult;
-            try
-            {
-                heuristicResult = await _heuristicLayer.AnalyzeAsync(
-                    request.Prompt,
-                    patternResult,
-                    cancellationToken);
-                executedLayers.Add(_heuristicLayer.LayerName);
-
-                _logger.LogDebug(
-                    "Heuristics: IsThreat={IsThreat}, Confidence={Confidence:P0}",
-                    heuristicResult.IsThreat,
-                    heuristicResult.Confidence);
-
-                // Early exit on definitive heuristic result
-                if (_heuristicLayer.IsDefinitiveResult(heuristicResult))
-                {
-                    var reason = heuristicResult.IsThreat == true ? "threat" : "safe";
-                    _logger.LogInformation(
-                        "Early exit: heuristics definitive {Reason} (Confidence={Confidence:P0})",
-                        reason,
-                        heuristicResult.Confidence);
-
-                    return CreateResult(
-                        analysisId,
-                        timestamp,
-                        overallStopwatch,
-                        languageFilterResult,
-                        patternResult,
-                        heuristicResult,
-                        mlResult: null,
-                        executedLayers,
-                        _heuristicLayer.LayerName);
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Heuristic layer failed");
-                heuristicResult = CreateFailedLayerResult(_heuristicLayer.LayerName);
-            }
-
-            // Layer 3: ML Classification (conditional)
-            LayerResult? mlResult = null;
-            if (_mlLayer != null && _options.ML.Enabled)
-            {
-                var combinedConfidence = CalculateCombinedConfidence(patternResult, heuristicResult);
-                var shouldSkipML = combinedConfidence < _options.ML.Threshold * 0.5;
-
-                if (!shouldSkipML)
-                {
-                    try
-                    {
-                        mlResult = await _mlLayer.AnalyzeAsync(request.Prompt, cancellationToken);
-                        executedLayers.Add(_mlLayer.LayerName);
-
-                        _logger.LogDebug(
-                            "ML classification: IsThreat={IsThreat}, Confidence={Confidence:P0}",
-                            mlResult.IsThreat,
-                            mlResult.Confidence);
-
-                        // Early exit on high-confidence ML detection
-                        if (mlResult.IsThreat == true && mlResult.Confidence >= _options.ML.Threshold)
-                        {
-                            _logger.LogInformation(
-                                "Early exit: ML classification (Confidence={Confidence:P0})",
-                                mlResult.Confidence);
-
-                            return CreateResult(
-                                analysisId,
-                                timestamp,
-                                overallStopwatch,
-                                languageFilterResult,
-                                patternResult,
-                                heuristicResult,
-                                mlResult,
-                                executedLayers,
-                                _mlLayer.LayerName);
-                        }
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "ML classification layer failed");
-                        mlResult = CreateFailedLayerResult(_mlLayer.LayerName);
-                    }
-                }
-                else
-                {
-                    _logger.LogDebug("Skipping ML layer: low combined risk");
-                }
-            }
-
-            // Final aggregated result
-            overallStopwatch.Stop();
-
-            var finalResult = CreateAggregatedResult(
-                analysisId,
-                timestamp,
-                overallStopwatch,
-                languageFilterResult,
-                patternResult,
-                heuristicResult,
-                mlResult,
-                executedLayers);
-
-            _logger.LogInformation(
-                "Analysis completed: IsThreat={IsThreat}, Confidence={Confidence:P0}, Duration={Duration}ms",
-                finalResult.IsThreat,
-                finalResult.Confidence,
-                finalResult.Duration.TotalMilliseconds);
-
-            return finalResult;
+            // Final aggregation
+            return CreateFinalResult(ctx);
         }
         catch (OperationCanceledException)
         {
@@ -291,119 +135,251 @@ public sealed class PipelineOrchestrator
         }
     }
 
-    private AnalysisResult CreateResult(
-        Guid analysisId,
-        DateTimeOffset timestamp,
-        Stopwatch stopwatch,
-        LanguageFilterResult? languageFilterResult,
-        LayerResult patternResult,
-        LayerResult? heuristicResult,
-        LayerResult? mlResult,
-        List<string> executedLayers,
-        string decisionLayer)
+    private async Task<AnalysisResult?> ExecuteLanguageFilterAsync(
+        PipelineContext ctx,
+        string prompt,
+        CancellationToken cancellationToken)
     {
-        stopwatch.Stop();
+        if (_languageFilterLayer == null || !_options.Language.Enabled)
+            return null;
+
+        ctx.LanguageFilterResult = await _languageFilterLayer.AnalyzeAsync(prompt, cancellationToken);
+
+        if (!ctx.LanguageFilterResult.WasExecuted)
+            return null;
+
+        ctx.ExecutedLayers.Add(_languageFilterLayer.LayerName);
+
+        _logger.LogDebug(
+            "Language filter: ShouldProceed={ShouldProceed}, Language={Language}",
+            ctx.LanguageFilterResult.ShouldProceed,
+            ctx.LanguageFilterResult.LanguageResult?.LanguageName ?? "unknown");
+
+        if (ctx.LanguageFilterResult.ShouldProceed || !ctx.LanguageFilterResult.IsBlocked)
+            return null;
+
+        _logger.LogInformation(
+            "Request blocked by language filter: {Message}",
+            ctx.LanguageFilterResult.Message);
+
+        return CreateLanguageBlockResult(ctx);
+    }
+
+    private async Task<AnalysisResult?> ExecutePatternMatchingAsync(
+        PipelineContext ctx,
+        string prompt,
+        CancellationToken cancellationToken)
+    {
+        ctx.PatternResult = await ExecuteLayerSafelyAsync(
+            () => _patternLayer.AnalyzeAsync(prompt, cancellationToken),
+            _patternLayer.LayerName,
+            ctx.ExecutedLayers);
+
+        _logger.LogDebug(
+            "Pattern matching: IsThreat={IsThreat}, Confidence={Confidence:P0}",
+            ctx.PatternResult.IsThreat,
+            ctx.PatternResult.Confidence);
+
+        if (ctx.PatternResult.IsThreat != true ||
+            ctx.PatternResult.Confidence < _options.PatternMatching.EarlyExitThreshold)
+            return null;
+
+        _logger.LogInformation(
+            "Early exit: pattern matching (Confidence={Confidence:P0})",
+            ctx.PatternResult.Confidence);
+
+        return CreateEarlyExitResult(ctx, _patternLayer.LayerName);
+    }
+
+    private async Task<AnalysisResult?> ExecuteHeuristicLayerAsync(
+        PipelineContext ctx,
+        string prompt,
+        CancellationToken cancellationToken)
+    {
+        ctx.HeuristicResult = await ExecuteLayerSafelyAsync(
+            () => _heuristicLayer.AnalyzeAsync(prompt, ctx.PatternResult!, cancellationToken),
+            _heuristicLayer.LayerName,
+            ctx.ExecutedLayers);
+
+        _logger.LogDebug(
+            "Heuristics: IsThreat={IsThreat}, Confidence={Confidence:P0}",
+            ctx.HeuristicResult.IsThreat,
+            ctx.HeuristicResult.Confidence);
+
+        if (!_heuristicLayer.IsDefinitiveResult(ctx.HeuristicResult))
+            return null;
+
+        var reason = ctx.HeuristicResult.IsThreat == true ? "threat" : "safe";
+        _logger.LogInformation(
+            "Early exit: heuristics definitive {Reason} (Confidence={Confidence:P0})",
+            reason,
+            ctx.HeuristicResult.Confidence);
+
+        return CreateEarlyExitResult(ctx, _heuristicLayer.LayerName);
+    }
+
+    private async Task<AnalysisResult?> ExecuteMLLayerAsync(
+        PipelineContext ctx,
+        string prompt,
+        CancellationToken cancellationToken)
+    {
+        if (_mlLayer == null || !_options.ML.Enabled)
+            return null;
+
+        var combinedConfidence = CalculateCombinedConfidence(ctx.PatternResult!, ctx.HeuristicResult!);
+        if (combinedConfidence < _options.ML.Threshold * 0.5)
+        {
+            _logger.LogDebug("Skipping ML layer: low combined risk");
+            return null;
+        }
+
+        ctx.MlResult = await ExecuteLayerSafelyAsync(
+            () => _mlLayer.AnalyzeAsync(prompt, cancellationToken),
+            _mlLayer.LayerName,
+            ctx.ExecutedLayers);
+
+        _logger.LogDebug(
+            "ML classification: IsThreat={IsThreat}, Confidence={Confidence:P0}",
+            ctx.MlResult.IsThreat,
+            ctx.MlResult.Confidence);
+
+        if (ctx.MlResult.IsThreat != true || ctx.MlResult.Confidence < _options.ML.Threshold)
+            return null;
+
+        _logger.LogInformation(
+            "Early exit: ML classification (Confidence={Confidence:P0})",
+            ctx.MlResult.Confidence);
+
+        return CreateEarlyExitResult(ctx, _mlLayer.LayerName);
+    }
+
+    private async Task<LayerResult> ExecuteLayerSafelyAsync(
+        Func<Task<LayerResult>> layerAction,
+        string layerName,
+        List<string> executedLayers)
+    {
+        try
+        {
+            var result = await layerAction();
+            executedLayers.Add(layerName);
+            return result;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "{LayerName} layer failed", layerName);
+            return CreateFailedLayerResult(layerName);
+        }
+    }
+
+    private AnalysisResult CreateEarlyExitResult(PipelineContext ctx, string decisionLayer)
+    {
+        ctx.Stopwatch.Stop();
 
         var (isThreat, confidence, threatInfo) = DetermineThreat(
-            patternResult,
-            heuristicResult,
-            mlResult,
+            ctx.PatternResult!,
+            ctx.HeuristicResult,
+            ctx.MlResult,
             decisionLayer);
-
-        var breakdown = new DetectionBreakdown
-        {
-            LanguageFilter = languageFilterResult?.ToLayerResult(),
-            PatternMatching = patternResult,
-            Heuristics = heuristicResult ?? CreateSkippedLayerResult("Heuristics"),
-            MLClassification = mlResult,
-            SemanticAnalysis = null,
-            ExecutedLayers = executedLayers
-        };
 
         return new AnalysisResult
         {
-            AnalysisId = analysisId,
+            AnalysisId = ctx.AnalysisId,
             IsThreat = isThreat,
             Confidence = confidence,
             ThreatInfo = threatInfo,
-            Breakdown = _options.IncludeBreakdown ? breakdown : CreateMinimalBreakdown(executedLayers),
+            Breakdown = CreateBreakdown(ctx),
             DecisionLayer = decisionLayer,
-            Duration = stopwatch.Elapsed,
-            Timestamp = timestamp
+            Duration = ctx.Stopwatch.Elapsed,
+            Timestamp = ctx.Timestamp
         };
     }
 
-    private AnalysisResult CreateAggregatedResult(
-        Guid analysisId,
-        DateTimeOffset timestamp,
-        Stopwatch stopwatch,
-        LanguageFilterResult? languageFilterResult,
+    private AnalysisResult CreateFinalResult(PipelineContext ctx)
+    {
+        ctx.Stopwatch.Stop();
+
+        var result = CreateAggregatedResult(ctx);
+
+        _logger.LogInformation(
+            "Analysis completed: IsThreat={IsThreat}, Confidence={Confidence:P0}, Duration={Duration}ms",
+            result.IsThreat,
+            result.Confidence,
+            result.Duration.TotalMilliseconds);
+
+        return result;
+    }
+
+    private DetectionBreakdown CreateBreakdown(PipelineContext ctx) => new()
+    {
+        LanguageFilter = ctx.LanguageFilterResult?.ToLayerResult(),
+        PatternMatching = ctx.PatternResult ?? CreateSkippedLayerResult("PatternMatching"),
+        Heuristics = ctx.HeuristicResult ?? CreateSkippedLayerResult("Heuristics"),
+        MLClassification = ctx.MlResult,
+        SemanticAnalysis = null,
+        ExecutedLayers = ctx.ExecutedLayers
+    };
+
+    private AnalysisResult CreateAggregatedResult(PipelineContext ctx)
+    {
+        var aggregateConfidence = CalculateAggregateConfidence(
+            ctx.PatternResult!,
+            ctx.HeuristicResult!,
+            ctx.MlResult);
+
+        var isThreat = aggregateConfidence >= _options.ThreatThreshold;
+
+        var threatInfo = isThreat
+            ? ThreatInfoBuilder.Build(ctx.PatternResult!, ctx.HeuristicResult!, ctx.MlResult, aggregateConfidence)
+            : null;
+
+        var breakdown = CreateBreakdown(ctx);
+
+        return new AnalysisResult
+        {
+            AnalysisId = ctx.AnalysisId,
+            IsThreat = isThreat,
+            Confidence = aggregateConfidence,
+            ThreatInfo = threatInfo,
+            Breakdown = _options.IncludeBreakdown ? breakdown : CreateMinimalBreakdown(ctx.ExecutedLayers),
+            DecisionLayer = "Aggregated",
+            Duration = ctx.Stopwatch.Elapsed,
+            Timestamp = ctx.Timestamp
+        };
+    }
+
+    private double CalculateAggregateConfidence(
         LayerResult patternResult,
         LayerResult heuristicResult,
-        LayerResult? mlResult,
-        List<string> executedLayers)
+        LayerResult? mlResult)
     {
         var patternWeight = _options.Aggregation.PatternMatchingWeight;
         var heuristicWeight = _options.Aggregation.HeuristicsWeight;
         var mlWeight = _options.Aggregation.MLClassificationWeight;
 
-        var patternConfidence = patternResult.Confidence ?? 0.0;
-        var heuristicConfidence = heuristicResult.Confidence ?? 0.0;
-        var mlConfidence = mlResult?.Confidence ?? 0.0;
-
         var totalWeight = patternWeight;
         if (heuristicResult.WasExecuted) totalWeight += heuristicWeight;
         if (mlResult is { WasExecuted: true }) totalWeight += mlWeight;
 
-        var normalizedPatternWeight = patternWeight / totalWeight;
-        var normalizedHeuristicWeight = heuristicResult.WasExecuted ? heuristicWeight / totalWeight : 0.0;
-        var normalizedMLWeight = mlResult is { WasExecuted: true } ? mlWeight / totalWeight : 0.0;
+        var patternConfidence = (patternResult.Confidence ?? 0.0) * patternWeight / totalWeight;
+        var heuristicConfidence = heuristicResult.WasExecuted
+            ? (heuristicResult.Confidence ?? 0.0) * heuristicWeight / totalWeight
+            : 0.0;
+        var mlConfidence = mlResult is { WasExecuted: true }
+            ? (mlResult.Confidence ?? 0.0) * mlWeight / totalWeight
+            : 0.0;
 
-        var aggregateConfidence = (patternConfidence * normalizedPatternWeight) +
-                                  (heuristicConfidence * normalizedHeuristicWeight) +
-                                  (mlConfidence * normalizedMLWeight);
-        aggregateConfidence = Math.Clamp(aggregateConfidence, 0.0, 1.0);
-
-        var isThreat = aggregateConfidence >= _options.ThreatThreshold;
-
-        ThreatInfo? threatInfo = null;
-        if (isThreat)
-        {
-            threatInfo = ThreatInfoBuilder.Build(patternResult, heuristicResult, mlResult, aggregateConfidence);
-        }
-
-        var breakdown = new DetectionBreakdown
-        {
-            LanguageFilter = languageFilterResult?.ToLayerResult(),
-            PatternMatching = patternResult,
-            Heuristics = heuristicResult,
-            MLClassification = mlResult,
-            SemanticAnalysis = null,
-            ExecutedLayers = executedLayers
-        };
-
-        return new AnalysisResult
-        {
-            AnalysisId = analysisId,
-            IsThreat = isThreat,
-            Confidence = aggregateConfidence,
-            ThreatInfo = threatInfo,
-            Breakdown = _options.IncludeBreakdown ? breakdown : CreateMinimalBreakdown(executedLayers),
-            DecisionLayer = "Aggregated",
-            Duration = stopwatch.Elapsed,
-            Timestamp = timestamp
-        };
+        return Math.Clamp(patternConfidence + heuristicConfidence + mlConfidence, 0.0, 1.0);
     }
 
-    private AnalysisResult CreateLanguageBlockResult(
-        Guid analysisId,
-        DateTimeOffset timestamp,
-        Stopwatch stopwatch,
-        LanguageFilterResult languageResult,
-        List<string> executedLayers)
+    private AnalysisResult CreateLanguageBlockResult(PipelineContext ctx)
     {
-        stopwatch.Stop();
+        ctx.Stopwatch.Stop();
 
+        var languageResult = ctx.LanguageFilterResult!;
         var detectedLanguage = languageResult.LanguageResult?.LanguageName ?? "Unknown";
         var supportedLanguages = string.Join(", ", _options.Language.SupportedLanguages);
 
@@ -424,19 +400,19 @@ public sealed class PipelineOrchestrator
             Heuristics = CreateSkippedLayerResult("Heuristics"),
             MLClassification = null,
             SemanticAnalysis = null,
-            ExecutedLayers = executedLayers
+            ExecutedLayers = ctx.ExecutedLayers
         };
 
         return new AnalysisResult
         {
-            AnalysisId = analysisId,
+            AnalysisId = ctx.AnalysisId,
             IsThreat = true,
             Confidence = languageResult.BlockConfidence,
             ThreatInfo = threatInfo,
-            Breakdown = _options.IncludeBreakdown ? breakdown : CreateMinimalBreakdown(executedLayers),
+            Breakdown = _options.IncludeBreakdown ? breakdown : CreateMinimalBreakdown(ctx.ExecutedLayers),
             DecisionLayer = "LanguageFilter",
-            Duration = stopwatch.Elapsed,
-            Timestamp = timestamp
+            Duration = ctx.Stopwatch.Elapsed,
+            Timestamp = ctx.Timestamp
         };
     }
 

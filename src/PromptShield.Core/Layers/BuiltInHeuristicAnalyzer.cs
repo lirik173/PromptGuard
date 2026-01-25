@@ -144,88 +144,31 @@ public sealed partial class BuiltInHeuristicAnalyzer : IHeuristicAnalyzer
             return Task.FromResult(new HeuristicResult
             {
                 Score = 0.0,
-                Signals = new List<HeuristicSignal>(),
+                Signals = [],
                 Explanation = "Prompt matched allowlist pattern - analysis skipped"
             });
         }
 
-        var signals = new List<HeuristicSignal>();
+        List<HeuristicSignal> signals = [];
 
-        // Check additional blocklist patterns first
-        var blocklistSignal = CheckBlocklist(prompt);
-        if (blocklistSignal != null)
-        {
-            signals.Add(blocklistSignal);
-        }
-
-        // Signal 1: Excessive Length
-        var lengthSignal = AnalyzeLength(prompt, context.Options.MaxPromptLength);
-        if (lengthSignal != null)
-        {
-            signals.Add(lengthSignal);
-        }
-
-        // Signal 2: Unusual Character Distribution
-        var charDistSignal = AnalyzeCharacterDistribution(prompt);
-        if (charDistSignal != null)
-        {
-            signals.Add(charDistSignal);
-        }
-
-        // Signal 3: Excessive Punctuation
-        var punctuationSignal = AnalyzePunctuation(prompt);
-        if (punctuationSignal != null)
-        {
-            signals.Add(punctuationSignal);
-        }
-
-        // Signal 4: Directive Language
-        var directiveSignal = _options.UseCompoundPatterns
+        AddSignalIfNotNull(signals, CheckBlocklist(prompt));
+        AddSignalIfNotNull(signals, AnalyzeLength(prompt, context.Options.MaxPromptLength));
+        AddSignalIfNotNull(signals, AnalyzeCharacterDistribution(prompt));
+        AddSignalIfNotNull(signals, AnalyzePunctuation(prompt));
+        
+        AddSignalIfNotNull(signals, _options.UseCompoundPatterns
             ? AnalyzeDirectiveLanguageCompound(prompt)
-            : AnalyzeDirectiveLanguageLegacy(prompt);
-        if (directiveSignal != null)
-        {
-            signals.Add(directiveSignal);
-        }
-
-        // Signal 5: Role Transition Keywords
-        var roleTransitionSignal = _options.UseCompoundPatterns
+            : AnalyzeDirectiveLanguageLegacy(prompt));
+        
+        AddSignalIfNotNull(signals, _options.UseCompoundPatterns
             ? AnalyzeRoleTransitionsCompound(prompt)
-            : AnalyzeRoleTransitionsLegacy(prompt);
-        if (roleTransitionSignal != null)
-        {
-            signals.Add(roleTransitionSignal);
-        }
+            : AnalyzeRoleTransitionsLegacy(prompt));
+        
+        AddSignalIfNotNull(signals, AnalyzeStructuralAnomalies(prompt));
+        AddSignalIfNotNull(signals, AnalyzeEncodingPatterns(prompt));
+        AddSignalIfNotNull(signals, AnalyzeSuspiciousUnicode(prompt));
+        AddSignalIfNotNull(signals, CheckPatternTimeouts(context.PatternMatchingResult));
 
-        // Signal 6: Structural Anomalies
-        var structureSignal = AnalyzeStructuralAnomalies(prompt);
-        if (structureSignal != null)
-        {
-            signals.Add(structureSignal);
-        }
-
-        // Signal 7: Encoding Patterns
-        var encodingSignal = AnalyzeEncodingPatterns(prompt);
-        if (encodingSignal != null)
-        {
-            signals.Add(encodingSignal);
-        }
-
-        // Signal 8: Suspicious Unicode Characters
-        var unicodeSignal = AnalyzeSuspiciousUnicode(prompt);
-        if (unicodeSignal != null)
-        {
-            signals.Add(unicodeSignal);
-        }
-
-        // Signal 9: Check for pattern timeouts from previous layer
-        var timeoutSignal = CheckPatternTimeouts(context.PatternMatchingResult);
-        if (timeoutSignal != null)
-        {
-            signals.Add(timeoutSignal);
-        }
-
-        // Calculate aggregate score with sensitivity adjustment
         var aggregateScore = CalculateAggregateScore(signals);
 
         var result = new HeuristicResult
@@ -240,11 +183,15 @@ public sealed partial class BuiltInHeuristicAnalyzer : IHeuristicAnalyzer
         return Task.FromResult(result);
     }
 
-    #region Allowlist / Blocklist
+    private static void AddSignalIfNotNull(List<HeuristicSignal> signals, HeuristicSignal? signal)
+    {
+        if (signal != null)
+            signals.Add(signal);
+    }
 
     private List<Regex> CompilePatterns(List<string> patterns, string listName)
     {
-        var compiled = new List<Regex>();
+        List<Regex> compiled = [];
         foreach (var pattern in patterns)
         {
             try
@@ -266,13 +213,10 @@ public sealed partial class BuiltInHeuristicAnalyzer : IHeuristicAnalyzer
             try
             {
                 if (regex.IsMatch(prompt))
-                {
                     return true;
-                }
             }
             catch (RegexMatchTimeoutException)
             {
-                // Timeout on allowlist check - don't allow, continue checking
             }
         }
         return false;
@@ -296,7 +240,6 @@ public sealed partial class BuiltInHeuristicAnalyzer : IHeuristicAnalyzer
             }
             catch (RegexMatchTimeoutException)
             {
-                // Timeout is suspicious
                 return new HeuristicSignal
                 {
                     Name = BuiltInHeuristicSignals.CustomBlocklist,
@@ -308,15 +251,9 @@ public sealed partial class BuiltInHeuristicAnalyzer : IHeuristicAnalyzer
         return null;
     }
 
-    #endregion
-
-    #region Signal Analyzers
-
     private HeuristicSignal? AnalyzeLength(string prompt, int maxLength)
     {
         var length = prompt.Length;
-
-        // Flag prompts that are unusually long (over 10% of max)
         var threshold = maxLength * 0.1;
 
         if (length > threshold)
@@ -356,12 +293,13 @@ public sealed partial class BuiltInHeuristicAnalyzer : IHeuristicAnalyzer
         return null;
     }
 
+    private static readonly HashSet<char> PunctuationCharsSet = ['#', '=', '-', '*', '_', '|', '/', '\\', '<', '>'];
+
     private HeuristicSignal? AnalyzePunctuation(string prompt)
     {
         if (prompt.Length == 0) return null;
 
-        var punctuationChars = new HashSet<char> { '#', '=', '-', '*', '_', '|', '/', '\\', '<', '>' };
-        var punctuationCount = prompt.Count(punctuationChars.Contains);
+        var punctuationCount = prompt.Count(PunctuationCharsSet.Contains);
         var ratio = (double)punctuationCount / prompt.Length;
 
         var threshold = _options.PunctuationRatioThreshold;
@@ -380,52 +318,17 @@ public sealed partial class BuiltInHeuristicAnalyzer : IHeuristicAnalyzer
         return null;
     }
 
-    /// <summary>
-    /// Analyzes directive language using compound patterns (recommended).
-    /// Reduces false positives by requiring context around keywords.
-    /// </summary>
     private HeuristicSignal? AnalyzeDirectiveLanguageCompound(string prompt)
     {
-        var lowerPrompt = prompt.ToLowerInvariant();
-        var matches = new List<(string Description, double Contribution)>();
-
-        foreach (var (pattern, baseContribution, description) in DirectiveCompoundPatterns)
-        {
-            try
-            {
-                if (Regex.IsMatch(lowerPrompt, pattern, RegexOptions.IgnoreCase, RegexTimeout))
-                {
-                    matches.Add((description, baseContribution));
-                }
-            }
-            catch (RegexMatchTimeoutException)
-            {
-                // Timeout is suspicious
-                matches.Add(("Pattern timeout during directive analysis", 0.5));
-            }
-        }
-
-        if (matches.Count > 0)
-        {
-            var maxContribution = matches.Max(m => m.Contribution);
-            var bonusForMultiple = Math.Min(0.1, matches.Count * 0.02);
-            var finalContribution = Math.Min(1.0, maxContribution + bonusForMultiple);
-
-            return new HeuristicSignal
-            {
-                Name = BuiltInHeuristicSignals.InstructionLanguage,
-                Contribution = AdjustContribution(finalContribution),
-                Description = $"Detected {matches.Count} directive pattern(s): {matches[0].Description}"
-            };
-        }
-
-        return null;
+        return AnalyzeCompoundPatterns(
+            prompt,
+            DirectiveCompoundPatterns,
+            BuiltInHeuristicSignals.InstructionLanguage,
+            "directive",
+            bonusMultiplier: 0.02,
+            maxBonus: 0.1);
     }
 
-    /// <summary>
-    /// Legacy directive language analysis using individual keywords.
-    /// Higher false positive rate - use compound patterns when possible.
-    /// </summary>
     private HeuristicSignal? AnalyzeDirectiveLanguageLegacy(string prompt)
     {
         var lowerPrompt = prompt.ToLowerInvariant();
@@ -453,49 +356,56 @@ public sealed partial class BuiltInHeuristicAnalyzer : IHeuristicAnalyzer
         return null;
     }
 
-    /// <summary>
-    /// Analyzes role transitions using compound patterns.
-    /// </summary>
     private HeuristicSignal? AnalyzeRoleTransitionsCompound(string prompt)
     {
-        var lowerPrompt = prompt.ToLowerInvariant();
-        var matches = new List<(string Description, double Contribution)>();
+        return AnalyzeCompoundPatterns(
+            prompt,
+            RoleTransitionPatterns,
+            BuiltInHeuristicSignals.RoleSwitching,
+            "role transition",
+            bonusMultiplier: 0.05,
+            maxBonus: 0.15);
+    }
 
-        foreach (var (pattern, baseContribution, description) in RoleTransitionPatterns)
+    private HeuristicSignal? AnalyzeCompoundPatterns(
+        string prompt,
+        (string Pattern, double BaseContribution, string Description)[] patterns,
+        string signalName,
+        string patternType,
+        double bonusMultiplier,
+        double maxBonus)
+    {
+        var lowerPrompt = prompt.ToLowerInvariant();
+        List<(string Description, double Contribution)> matches = [];
+
+        foreach (var (pattern, baseContribution, description) in patterns)
         {
             try
             {
                 if (Regex.IsMatch(lowerPrompt, pattern, RegexOptions.IgnoreCase, RegexTimeout))
-                {
                     matches.Add((description, baseContribution));
-                }
             }
             catch (RegexMatchTimeoutException)
             {
-                matches.Add(("Pattern timeout during role analysis", 0.5));
+                matches.Add(($"Pattern timeout during {patternType} analysis", 0.5));
             }
         }
 
-        if (matches.Count > 0)
+        if (matches.Count == 0)
+            return null;
+
+        var maxContribution = matches.Max(m => m.Contribution);
+        var bonusForMultiple = Math.Min(maxBonus, matches.Count * bonusMultiplier);
+        var finalContribution = Math.Min(1.0, maxContribution + bonusForMultiple);
+
+        return new HeuristicSignal
         {
-            var maxContribution = matches.Max(m => m.Contribution);
-            var bonusForMultiple = Math.Min(0.15, matches.Count * 0.05);
-            var finalContribution = Math.Min(1.0, maxContribution + bonusForMultiple);
-
-            return new HeuristicSignal
-            {
-                Name = BuiltInHeuristicSignals.RoleSwitching,
-                Contribution = AdjustContribution(finalContribution),
-                Description = $"Detected {matches.Count} role transition pattern(s): {matches[0].Description}"
-            };
-        }
-
-        return null;
+            Name = signalName,
+            Contribution = AdjustContribution(finalContribution),
+            Description = $"Detected {matches.Count} {patternType} pattern(s): {matches[0].Description}"
+        };
     }
 
-    /// <summary>
-    /// Legacy role transition analysis.
-    /// </summary>
     private HeuristicSignal? AnalyzeRoleTransitionsLegacy(string prompt)
     {
         var lowerPrompt = prompt.ToLowerInvariant();
@@ -517,114 +427,115 @@ public sealed partial class BuiltInHeuristicAnalyzer : IHeuristicAnalyzer
 
     private HeuristicSignal? AnalyzeStructuralAnomalies(string prompt)
     {
-        try
-        {
-            var hasRepeatedDelimiters = RepeatedDelimitersRegex().IsMatch(prompt);
-            var hasStructureMarkers = StructureMarkersRegex().IsMatch(prompt);
-
-            if (hasRepeatedDelimiters || hasStructureMarkers)
-            {
-                var contribution = hasStructureMarkers ? 0.85 : 0.65;
-                return new HeuristicSignal
-                {
-                    Name = BuiltInHeuristicSignals.AnomalousStructure,
-                    Contribution = AdjustContribution(contribution),
-                    Description = hasStructureMarkers
-                        ? "Contains structural markers suggesting prompt manipulation"
-                        : "Contains repeated delimiter patterns"
-                };
-            }
-        }
-        catch (RegexMatchTimeoutException)
-        {
-            return new HeuristicSignal
-            {
-                Name = BuiltInHeuristicSignals.AnomalousStructure,
-                Contribution = AdjustContribution(0.5),
-                Description = "Structure analysis timed out - potential complexity attack"
-            };
-        }
-
-        return null;
+        return AnalyzeRegexPair(
+            prompt,
+            () => RepeatedDelimitersRegex().IsMatch(prompt),
+            () => StructureMarkersRegex().IsMatch(prompt),
+            BuiltInHeuristicSignals.AnomalousStructure,
+            firstDescription: "Contains repeated delimiter patterns",
+            secondDescription: "Contains structural markers suggesting prompt manipulation",
+            bothDescription: "Contains structural markers suggesting prompt manipulation",
+            timeoutDescription: "Structure analysis timed out - potential complexity attack",
+            firstContribution: 0.65,
+            secondContribution: 0.85,
+            bothContribution: 0.85);
     }
 
     private HeuristicSignal? AnalyzeEncodingPatterns(string prompt)
     {
+        return AnalyzeRegexPair(
+            prompt,
+            () => Base64Regex().IsMatch(prompt),
+            () => HexEncodingRegex().IsMatch(prompt),
+            BuiltInHeuristicSignals.EncodingPatterns,
+            firstDescription: "Contains potential base64-encoded content",
+            secondDescription: "Contains potential hex-encoded content",
+            bothDescription: "Contains both base64 and hex encoding patterns",
+            timeoutDescription: "Encoding analysis timed out",
+            firstContribution: 0.7,
+            secondContribution: 0.7,
+            bothContribution: 0.85);
+    }
+
+    private HeuristicSignal? AnalyzeRegexPair(
+        string prompt,
+        Func<bool> firstCheck,
+        Func<bool> secondCheck,
+        string signalName,
+        string firstDescription,
+        string secondDescription,
+        string bothDescription,
+        string timeoutDescription,
+        double firstContribution,
+        double secondContribution,
+        double bothContribution)
+    {
         try
         {
-            var hasBase64Pattern = Base64Regex().IsMatch(prompt);
-            var hasHexPattern = HexEncodingRegex().IsMatch(prompt);
+            var firstMatch = firstCheck();
+            var secondMatch = secondCheck();
 
-            if (hasBase64Pattern || hasHexPattern)
+            if (!firstMatch && !secondMatch)
+                return null;
+
+            var (contribution, description) = (firstMatch, secondMatch) switch
             {
-                var contribution = hasBase64Pattern && hasHexPattern ? 0.85 : 0.7;
-                return new HeuristicSignal
-                {
-                    Name = BuiltInHeuristicSignals.EncodingPatterns,
-                    Contribution = AdjustContribution(contribution),
-                    Description = hasBase64Pattern && hasHexPattern
-                        ? "Contains both base64 and hex encoding patterns"
-                        : hasBase64Pattern
-                            ? "Contains potential base64-encoded content"
-                            : "Contains potential hex-encoded content"
-                };
-            }
+                (true, true) => (bothContribution, bothDescription),
+                (true, false) => (firstContribution, firstDescription),
+                (false, true) => (secondContribution, secondDescription),
+                _ => (0.0, string.Empty)
+            };
+
+            return new HeuristicSignal
+            {
+                Name = signalName,
+                Contribution = AdjustContribution(contribution),
+                Description = description
+            };
         }
         catch (RegexMatchTimeoutException)
         {
             return new HeuristicSignal
             {
-                Name = BuiltInHeuristicSignals.EncodingPatterns,
+                Name = signalName,
                 Contribution = AdjustContribution(0.5),
-                Description = "Encoding analysis timed out"
+                Description = timeoutDescription
             };
         }
-
-        return null;
     }
+
+    private static readonly HashSet<char> ZeroWidthChars = ['\u200B', '\u200C', '\u200D', '\uFEFF'];
+    private static readonly HashSet<char> BidiChars = ['\u202A', '\u202B', '\u202C', '\u202D', '\u202E', '\u2066', '\u2067', '\u2068', '\u2069'];
 
     private HeuristicSignal? AnalyzeSuspiciousUnicode(string prompt)
     {
-        // Zero-width characters
-        var zeroWidthChars = new[] { '\u200B', '\u200C', '\u200D', '\uFEFF' };
-        var hasZeroWidth = prompt.Any(c => zeroWidthChars.Contains(c));
+        var hasZeroWidth = prompt.Any(ZeroWidthChars.Contains);
+        var hasBidi = prompt.Any(BidiChars.Contains);
 
-        // Bidirectional override characters
-        var bidiChars = new[] { '\u202A', '\u202B', '\u202C', '\u202D', '\u202E', '\u2066', '\u2067', '\u2068', '\u2069' };
-        var hasBidi = prompt.Any(c => bidiChars.Contains(c));
-
-        if (hasZeroWidth && hasBidi)
+        return (hasZeroWidth, hasBidi) switch
         {
-            return new HeuristicSignal
-            {
-                Name = BuiltInHeuristicSignals.SuspiciousUnicode,
-                Contribution = AdjustContribution(0.9),
-                Description = "Contains both zero-width and bidirectional override characters"
-            };
-        }
-
-        if (hasBidi)
-        {
-            return new HeuristicSignal
-            {
-                Name = BuiltInHeuristicSignals.BidirectionalOverride,
-                Contribution = AdjustContribution(0.8),
-                Description = "Contains bidirectional text override characters"
-            };
-        }
-
-        if (hasZeroWidth)
-        {
-            return new HeuristicSignal
-            {
-                Name = BuiltInHeuristicSignals.InvisibleCharacters,
-                Contribution = AdjustContribution(0.6),
-                Description = "Contains zero-width or invisible characters"
-            };
-        }
-
-        return null;
+            (true, true) => CreateSignal(
+                BuiltInHeuristicSignals.SuspiciousUnicode,
+                0.9,
+                "Contains both zero-width and bidirectional override characters"),
+            (false, true) => CreateSignal(
+                BuiltInHeuristicSignals.BidirectionalOverride,
+                0.8,
+                "Contains bidirectional text override characters"),
+            (true, false) => CreateSignal(
+                BuiltInHeuristicSignals.InvisibleCharacters,
+                0.6,
+                "Contains zero-width or invisible characters"),
+            _ => null
+        };
     }
+
+    private HeuristicSignal CreateSignal(string name, double contribution, string description) => new()
+    {
+        Name = name,
+        Contribution = AdjustContribution(contribution),
+        Description = description
+    };
 
     private static HeuristicSignal? CheckPatternTimeouts(LayerResult patternResult)
     {
@@ -649,13 +560,6 @@ public sealed partial class BuiltInHeuristicAnalyzer : IHeuristicAnalyzer
         return null;
     }
 
-    #endregion
-
-    #region Sensitivity Adjustment
-
-    /// <summary>
-    /// Adjusts contribution score based on sensitivity level.
-    /// </summary>
     private double AdjustContribution(double baseContribution)
     {
         var multiplier = _options.Sensitivity switch
@@ -670,10 +574,6 @@ public sealed partial class BuiltInHeuristicAnalyzer : IHeuristicAnalyzer
         return Math.Clamp(baseContribution * multiplier, 0.0, 1.0);
     }
 
-    /// <summary>
-    /// Adjusts threshold based on sensitivity level.
-    /// Lower sensitivity = higher thresholds (harder to trigger).
-    /// </summary>
     private int GetAdjustedThreshold(int baseThreshold)
     {
         return _options.Sensitivity switch
@@ -686,9 +586,6 @@ public sealed partial class BuiltInHeuristicAnalyzer : IHeuristicAnalyzer
         };
     }
 
-    /// <summary>
-    /// Calculates aggregate score from all signals.
-    /// </summary>
     private double CalculateAggregateScore(List<HeuristicSignal> signals)
     {
         if (signals.Count == 0)
@@ -696,17 +593,12 @@ public sealed partial class BuiltInHeuristicAnalyzer : IHeuristicAnalyzer
             return 0.0;
         }
 
-        // Use weighted combination: max contribution + average bonus
         var maxContribution = signals.Max(s => s.Contribution);
         var averageBonus = signals.Average(s => s.Contribution) * 0.2;
 
         var aggregateScore = Math.Min(1.0, maxContribution + averageBonus);
         return Math.Clamp(aggregateScore, 0.0, 1.0);
     }
-
-    #endregion
-
-    #region Generated Regex
 
     [GeneratedRegex(@"(#{3,}|={3,}|-{3,}|\*{3,}|_{3,})", RegexOptions.None, matchTimeoutMilliseconds: 50)]
     private static partial Regex RepeatedDelimitersRegex();
@@ -719,6 +611,4 @@ public sealed partial class BuiltInHeuristicAnalyzer : IHeuristicAnalyzer
 
     [GeneratedRegex(@"(?:\\x[0-9a-fA-F]{2}){10,}", RegexOptions.None, matchTimeoutMilliseconds: 50)]
     private static partial Regex HexEncodingRegex();
-
-    #endregion
 }

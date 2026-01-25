@@ -280,14 +280,6 @@ As a POC, this project has the following limitations:
 - ✅ **Language Filter mitigation** — Non-English prompts can be routed to Semantic Analysis (LLM-based)
 - 🔧 **Extensibility** — Implement `IPatternProvider` to add patterns for other languages
 
-### Other Limitations
-
-- ❌ **No pre-trained ML model** — ML layer requires external ONNX model
-- ❌ **Limited pattern library** — Built-in patterns are illustrative only
-- ❌ **No production hardening** — Error handling and edge cases are minimal
-- ❌ **No real-time pattern updates** — Static pattern loading only
-- ❌ **No caching layer** — Every prompt is analyzed from scratch
-
 ---
 
 ## Contributing

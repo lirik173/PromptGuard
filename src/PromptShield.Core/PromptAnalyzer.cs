@@ -33,7 +33,7 @@ public sealed class PromptAnalyzer : IPromptAnalyzer
         _pipeline = pipeline ?? throw new ArgumentNullException(nameof(pipeline));
         _validator = validator ?? throw new ArgumentNullException(nameof(validator));
         _options = options ?? throw new ArgumentNullException(nameof(options));
-        _eventHandlers = eventHandlers ?? Enumerable.Empty<IPromptShieldEventHandler>();
+        _eventHandlers = eventHandlers ?? [];
         _logger = logger ?? NullLogger<PromptAnalyzer>.Instance;
     }
 
@@ -55,7 +55,6 @@ public sealed class PromptAnalyzer : IPromptAnalyzer
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        // Validate request
         var validationResult = _validator.Validate(request);
         if (!validationResult.IsValid)
         {
@@ -64,10 +63,7 @@ public sealed class PromptAnalyzer : IPromptAnalyzer
             throw new ValidationException("VALIDATION_FAILED", errorMessage);
         }
 
-        // Generate analysis ID upfront for event correlation
         var analysisId = Guid.NewGuid();
-
-        // Start telemetry activity if enabled
         using var activity = TelemetryHelper.StartActivity("PromptShield.Analyze", _options.Telemetry);
         activity?.SetTag("analysis.id", analysisId.ToString());
         activity?.SetTag("prompt.length", request.Prompt.Length);
@@ -76,30 +72,26 @@ public sealed class PromptAnalyzer : IPromptAnalyzer
             activity?.SetTag("user.id", request.Metadata.UserId);
         }
 
-        _logger.LogInformation(
-            "Starting prompt analysis: AnalysisId={AnalysisId}, PromptLength={Length}, UserId={UserId}, ConversationId={ConversationId}",
-            analysisId,
-            request.Prompt.Length,
-            request.Metadata?.UserId,
-            request.Metadata?.ConversationId);
+            _logger.LogInformation(
+                "Starting prompt analysis: AnalysisId={AnalysisId}, PromptLength={Length}, UserId={UserId}, ConversationId={ConversationId}",
+                analysisId,
+                request.Prompt.Length,
+                request.Metadata?.UserId,
+                request.Metadata?.ConversationId);
 
-        // Emit metrics if enabled
         if (TelemetryHelper.ShouldEmitTelemetry(_options.Telemetry))
         {
             PromptShieldTelemetry.AnalysisTotal.Add(1);
             PromptShieldTelemetry.PromptLength.Record(request.Prompt.Length);
         }
 
-        // Raise AnalysisStarted event BEFORE pipeline execution
         await RaiseAnalysisStartedAsync(analysisId, request, cancellationToken);
 
         AnalysisResult result;
         try
         {
-            // Execute pipeline with the pre-generated analysis ID
             result = await _pipeline.ExecuteAsync(request, analysisId, cancellationToken);
 
-            // Emit metrics
             if (TelemetryHelper.ShouldEmitTelemetry(_options.Telemetry))
             {
                 PromptShieldTelemetry.AnalysisLatency.Record(result.Duration.TotalMilliseconds);
@@ -137,18 +129,13 @@ public sealed class PromptAnalyzer : IPromptAnalyzer
         {
             _logger.LogError(ex, "Analysis failed: AnalysisId={AnalysisId}", analysisId);
 
-            // Emit error metric
             if (TelemetryHelper.ShouldEmitTelemetry(_options.Telemetry))
-            {
                 PromptShieldTelemetry.AnalysisErrors.Add(1);
-            }
 
             activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
-            // Note: RecordException is an OpenTelemetry extension, not available in base Activity
             activity?.SetTag("exception.type", ex.GetType().FullName);
             activity?.SetTag("exception.message", ex.Message);
 
-            // Check failure behavior
             if (_options.OnAnalysisError == FailureBehavior.FailClosed)
             {
                 throw new PromptShieldException(
@@ -156,7 +143,6 @@ public sealed class PromptAnalyzer : IPromptAnalyzer
                     ex);
             }
 
-            // Fail-open: create a "safe" result with warning
             _logger.LogWarning(
                 "Returning safe result due to fail-open configuration. AnalysisId={AnalysisId}",
                 analysisId);
@@ -164,13 +150,9 @@ public sealed class PromptAnalyzer : IPromptAnalyzer
             return CreateFailOpenResult(analysisId, request);
         }
 
-        // Raise threat detection event if applicable
         if (result.IsThreat && result.ThreatInfo != null)
-        {
             await RaiseThreatDetectedAsync(request, result, cancellationToken);
-        }
 
-        // Raise AnalysisCompleted event
         await RaiseAnalysisCompletedAsync(request, result, cancellationToken);
 
         return result;
@@ -190,7 +172,7 @@ public sealed class PromptAnalyzer : IPromptAnalyzer
                 Heuristics = CreateErrorLayerResult("Heuristics"),
                 MLClassification = null,
                 SemanticAnalysis = null,
-                ExecutedLayers = new List<string>()
+                ExecutedLayers = []
             },
             DecisionLayer = "FailOpen",
             Duration = TimeSpan.Zero,
@@ -208,7 +190,7 @@ public sealed class PromptAnalyzer : IPromptAnalyzer
         };
     }
 
-    private async Task RaiseAnalysisStartedAsync(
+    private Task RaiseAnalysisStartedAsync(
         Guid analysisId,
         AnalysisRequest request,
         CancellationToken cancellationToken)
@@ -220,29 +202,14 @@ public sealed class PromptAnalyzer : IPromptAnalyzer
             Timestamp = DateTimeOffset.UtcNow
         };
 
-        foreach (var handler in _eventHandlers)
-        {
-            try
-            {
-                await handler.OnAnalysisStartedAsync(@event, cancellationToken);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                _logger.LogDebug("Event handler cancelled during AnalysisStarted");
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(
-                    ex,
-                    "Event handler {HandlerType} failed on AnalysisStarted",
-                    handler.GetType().Name);
-                // Continue with other handlers - event handler failure should not block analysis
-            }
-        }
+        return RaiseEventAsync(
+            @event,
+            "AnalysisStarted",
+            (h, e, ct) => h.OnAnalysisStartedAsync(e, ct),
+            cancellationToken);
     }
 
-    private async Task RaiseThreatDetectedAsync(
+    private Task RaiseThreatDetectedAsync(
         AnalysisRequest request,
         AnalysisResult result,
         CancellationToken cancellationToken)
@@ -256,29 +223,14 @@ public sealed class PromptAnalyzer : IPromptAnalyzer
             Timestamp = result.Timestamp
         };
 
-        foreach (var handler in _eventHandlers)
-        {
-            try
-            {
-                await handler.OnThreatDetectedAsync(@event, cancellationToken);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                _logger.LogDebug("Event handler cancelled during ThreatDetected");
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(
-                    ex,
-                    "Event handler {HandlerType} failed on ThreatDetected",
-                    handler.GetType().Name);
-                // Continue with other handlers
-            }
-        }
+        return RaiseEventAsync(
+            @event,
+            "ThreatDetected",
+            (h, e, ct) => h.OnThreatDetectedAsync(e, ct),
+            cancellationToken);
     }
 
-    private async Task RaiseAnalysisCompletedAsync(
+    private Task RaiseAnalysisCompletedAsync(
         AnalysisRequest request,
         AnalysisResult result,
         CancellationToken cancellationToken)
@@ -290,24 +242,37 @@ public sealed class PromptAnalyzer : IPromptAnalyzer
             Timestamp = result.Timestamp
         };
 
+        return RaiseEventAsync(
+            @event,
+            "AnalysisCompleted",
+            (h, e, ct) => h.OnAnalysisCompletedAsync(e, ct),
+            cancellationToken);
+    }
+
+    private async Task RaiseEventAsync<TEvent>(
+        TEvent @event,
+        string eventName,
+        Func<IPromptShieldEventHandler, TEvent, CancellationToken, Task> invoker,
+        CancellationToken cancellationToken)
+    {
         foreach (var handler in _eventHandlers)
         {
             try
             {
-                await handler.OnAnalysisCompletedAsync(@event, cancellationToken);
+                await invoker(handler, @event, cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                _logger.LogDebug("Event handler cancelled during AnalysisCompleted");
+                _logger.LogDebug("Event handler cancelled during {EventName}", eventName);
                 throw;
             }
             catch (Exception ex)
             {
                 _logger.LogError(
                     ex,
-                    "Event handler {HandlerType} failed on AnalysisCompleted",
-                    handler.GetType().Name);
-                // Continue with other handlers
+                    "Event handler {HandlerType} failed on {EventName}",
+                    handler.GetType().Name,
+                    eventName);
             }
         }
     }
